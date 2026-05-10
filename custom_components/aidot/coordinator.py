@@ -21,12 +21,15 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .ble_gateway_client import BleGatewayDeviceClient
 from .const import DOMAIN
 
 type AidotConfigEntry = ConfigEntry[AidotDeviceManagerCoordinator]
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_DEVICE_LIST_INTERVAL = timedelta(hours=6)
+
+_HUB_TYPE = "BleMesh_Hub"
 
 
 class AidotDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceStatusData]):
@@ -99,15 +102,36 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             data = await self.client.async_get_all_device()
         except AidotAuthFailed as error:
             raise ConfigEntryAuthFailed from error
-        current_devices = {
-            device[CONF_ID]: device
-            for device in data[CONF_DEVICE_LIST]
+
+        all_devices: list[dict] = data[CONF_DEVICE_LIST]
+
+        hub_devices = {
+            d[CONF_ID]: d
+            for d in all_devices
+            if d.get(CONF_TYPE) == _HUB_TYPE
+        }
+
+        wifi_devices = {
+            d[CONF_ID]: d
+            for d in all_devices
             if (
-                device[CONF_TYPE] == "light"
-                and CONF_AES_KEY in device
-                and device[CONF_AES_KEY][0] is not None
+                d.get(CONF_TYPE) == "light"
+                and CONF_AES_KEY in d
+                and d[CONF_AES_KEY][0] is not None
             )
         }
+
+        ble_devices = {
+            d[CONF_ID]: d
+            for d in all_devices
+            if (
+                d.get(CONF_TYPE) == "light"
+                and d.get("directGateway") in hub_devices
+                and d.get("bleMeshDeviceKey") is not None
+            )
+        }
+
+        current_devices = {**wifi_devices, **ble_devices}
 
         removed_ids = set(self.device_coordinators) - set(current_devices)
         for dev_id in removed_ids:
@@ -116,9 +140,23 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         if removed_ids:
             self._purge_deleted_lists()
 
+        user_id: str = self.config_entry.data.get(CONF_ID, "")
+
         for dev_id, device in current_devices.items():
             if dev_id not in self.device_coordinators:
-                device_client = self.client.get_device_client(device)
+                if dev_id in ble_devices:
+                    hub_device = hub_devices[device["directGateway"]]
+                    device_client: DeviceClient | BleGatewayDeviceClient = (
+                        BleGatewayDeviceClient(device, hub_device, user_id)
+                    )
+                    _LOGGER.debug(
+                        "Using BLE gateway client for %s via hub %s",
+                        device.get("name"),
+                        hub_device.get("name"),
+                    )
+                else:
+                    device_client = self.client.get_device_client(device)
+
                 device_coordinator = AidotDeviceUpdateCoordinator(
                     self.hass, self.config_entry, device_client
                 )
@@ -144,7 +182,6 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
 
     def _purge_deleted_lists(self) -> None:
         """Purge device entries of deleted lists."""
-
         device_reg = dr.async_get(self.hass)
         identifiers = {
             (
