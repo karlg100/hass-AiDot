@@ -1,10 +1,12 @@
 {
     "config": {
         "abort": {
-            "already_configured": "The account in the current region has already been configured"
+            "already_configured": "The account in the current region has already been configured",
+            "reauth_successful": "Re-authentication was successful"
         },
         "error": {
-            "invalid_auth": "Authentication failed, please ensure that the network is functioning properly and the account password is correct."
+            "cannot_connect": "Failed to connect",
+            "invalid_auth": "Invalid authentication"
         },
         "step": {
             "user": {
@@ -18,6 +20,18 @@
                     "password": "Password for logging in through Aidot app",
                     "username": "Account logged in through Aidot app"
                 }
+            },
+            "reauth_confirm": {
+                "title": "Reauthenticate",
+                "data": {
+                    "password": "Password",
+                    "username": "Username"
+                },
+                "data_description": {
+                    "password": "Password",
+                    "username": "Username"
+                },
+                "description": "Please re-enter your credentials to re-authenticate."
             }
         }
     }
