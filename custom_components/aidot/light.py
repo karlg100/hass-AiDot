@@ -10,11 +10,7 @@ from homeassistant.components.light import (
     LightEntity,
 )
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.device_registry import (
-    CONNECTION_NETWORK_MAC,
-    DeviceInfo,
-    format_mac,
-)
+from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -53,7 +49,7 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         model_id = coordinator.device_client.info.model_id
         manufacturer = model_id.split(".")[0]
         model = model_id[len(manufacturer) + 1 :]
-        mac = format_mac(coordinator.device_client.info.mac)
+        mac = coordinator.device_client.info.mac
 
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, self._attr_unique_id)},
@@ -76,7 +72,6 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
 
     def _update_status(self) -> None:
         """Update light status from coordinator data."""
-        self._attr_available = self.coordinator.data.online
         self._attr_is_on = self.coordinator.data.on
         self._attr_brightness = self.coordinator.data.dimming
         self._attr_color_temp_kelvin = self.coordinator.data.cct
@@ -85,7 +80,7 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
     @property
     def available(self) -> bool:
         """Return if entity is available."""
-        return self.coordinator.data.online
+        return super().available and self.coordinator.data.online
 
     @callback
     def _handle_coordinator_update(self) -> None:
