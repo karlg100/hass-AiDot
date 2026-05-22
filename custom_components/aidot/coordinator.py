@@ -16,7 +16,7 @@ from aidot.exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryError
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
@@ -91,14 +91,14 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         try:
             await self.async_auto_login()
         except AidotUserOrPassIncorrect as error:
-            raise ConfigEntryError from error
+            raise ConfigEntryAuthFailed from error
 
     async def _async_update_data(self) -> None:
         """Update data async."""
         try:
             data = await self.client.async_get_all_device()
         except AidotAuthFailed as error:
-            raise ConfigEntryError from error
+            raise ConfigEntryAuthFailed from error
         current_devices = {
             device[CONF_ID]: device
             for device in data[CONF_DEVICE_LIST]
