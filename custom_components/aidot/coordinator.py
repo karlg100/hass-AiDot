@@ -82,9 +82,12 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             name=DOMAIN,
             update_interval=UPDATE_DEVICE_LIST_INTERVAL,
         )
+        # Unwrap old nested {"login_info": {...}} format: python-aidot 0.3.54b2 client.py
+        # references CONF_LOGIN_INFO without importing it (NameError on old-format entries).
+        token_data = config_entry.data.get("login_info", config_entry.data)
         self.client = AidotClient(
             session=async_get_clientsession(hass),
-            token=config_entry.data,
+            token=token_data,
         )
         self.client.set_token_fresh_cb(self.token_fresh_cb)
         self.device_coordinators: dict[str, AidotDeviceUpdateCoordinator] = {}
@@ -140,7 +143,9 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         if removed_ids:
             self._purge_deleted_lists()
 
-        user_id: str = self.config_entry.data.get(CONF_ID, "")
+        # Handle both old (nested login_info) and new (flat) config entry data formats
+        login_data = self.config_entry.data.get("login_info", self.config_entry.data)
+        user_id: str = login_data.get("id", "")
 
         for dev_id, device in current_devices.items():
             if dev_id not in self.device_coordinators:
