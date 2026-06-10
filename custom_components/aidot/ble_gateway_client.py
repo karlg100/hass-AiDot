@@ -15,6 +15,8 @@ from aidot.aes_utils import aes_encrypt as _aes_encrypt_raw, aes_decrypt as _aes
 
 _HUB_PORT = 10000
 _TIMEOUT = 8
+_MAX_RETRIES = 3
+_BACKOFF = 0.5
 
 
 def _make_aes_key(key_str: str) -> bytes:
@@ -74,6 +76,135 @@ def _next_seq() -> str:
     global _seq
     _seq += 1
     return "ha93" + str(_seq).zfill(5)
+
+
+class _HubSession:
+    """One persistent, serialised connection to an AiDot hub.
+
+    All BLE devices behind the same hub share a single session, so a per-hub
+    lock serialises commands (the hub resets the socket on concurrent logins)
+    and one logged-in connection is reused across commands (removing the
+    per-command connect+login latency). Transient drops are retried; the retry
+    path also recovers a connection the hub closed while idle.
+    """
+
+    def __init__(
+        self,
+        hub_id: str,
+        hub_ip: str,
+        aes_key: bytes,
+        user_id: str,
+        hub_password: str,
+    ) -> None:
+        self._hub_id = hub_id
+        self._hub_ip = hub_ip
+        self._aes_key = aes_key
+        self._user_id = user_id
+        self._hub_password = hub_password
+        self._lock = asyncio.Lock()
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._asc = 1
+
+    async def send_command(self, dev_id: str, attr: dict) -> None:
+        """Serialise, (re)connect as needed, and send one setDevAttr command."""
+        async with self._lock:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    await self._ensure_connected()
+                    await self._send_set_attr(dev_id, attr)
+                    return
+                except (
+                    ConnectionError,
+                    asyncio.TimeoutError,
+                    asyncio.IncompleteReadError,
+                ):
+                    await self._close()
+                    if attempt == _MAX_RETRIES - 1:
+                        raise
+                    await asyncio.sleep(_BACKOFF * (attempt + 1))
+
+    async def _ensure_connected(self) -> None:
+        if self._writer is None or self._writer.is_closing():
+            await self._connect_and_login()
+
+    async def _connect_and_login(self) -> None:
+        self._reader, self._writer = await asyncio.wait_for(
+            asyncio.open_connection(self._hub_ip, _HUB_PORT), timeout=_TIMEOUT
+        )
+        seq = str(int(time.time() * 1000) + 1)[-9:]
+        login = json.dumps({
+            "service": "device",
+            "method": "loginReq",
+            "seq": seq,
+            "srcAddr": self._user_id,
+            "deviceId": self._hub_id,
+            "payload": {
+                "userId": self._user_id,
+                "password": self._hub_password,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+                "ascNumber": 1,
+            },
+        }).encode()
+        self._writer.write(_frame(login, self._aes_key))
+        await self._writer.drain()
+        resp = await _recv(self._reader, self._aes_key)
+        self._asc = resp.get("payload", {}).get("ascNumber", 1) + 1
+
+    async def _send_set_attr(self, dev_id: str, attr: dict) -> None:
+        cmd = json.dumps({
+            "method": "setDevAttrReq",
+            "service": "device",
+            "clientId": "ha-" + self._user_id,
+            "srcAddr": "0." + self._user_id,
+            "seq": _next_seq(),
+            "payload": {
+                "devId": dev_id,
+                "parentId": self._hub_id,
+                "userId": self._user_id,
+                "password": self._hub_password,
+                "attr": attr,
+                "channel": "ble",
+                "ascNumber": self._asc,
+            },
+            "tst": int(time.time() * 1000),
+            "deviceId": dev_id,
+        }).encode()
+        self._asc += 1
+        self._writer.write(_frame(cmd, self._aes_key))
+        await self._writer.drain()
+        await _recv(self._reader, self._aes_key)
+
+    async def _close(self) -> None:
+        writer = self._writer
+        self._reader = None
+        self._writer = None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001 - closing is best-effort
+                pass
+
+
+_HUB_SESSIONS: dict[str, _HubSession] = {}
+
+
+def _get_hub_session(
+    hub_id: str, hub_ip: str, aes_key: bytes, user_id: str, hub_password: str
+) -> _HubSession:
+    """Return the shared session for a hub, creating it on first use."""
+    session = _HUB_SESSIONS.get(hub_id)
+    if session is None or session._hub_ip != hub_ip:
+        session = _HubSession(hub_id, hub_ip, aes_key, user_id, hub_password)
+        _HUB_SESSIONS[hub_id] = session
+    return session
+
+
+async def close_all_hub_sessions() -> None:
+    """Close every open hub connection and clear the registry (on unload)."""
+    for session in list(_HUB_SESSIONS.values()):
+        await session._close()
+    _HUB_SESSIONS.clear()
 
 
 class BleGatewayDeviceClient:
@@ -139,53 +270,14 @@ class BleGatewayDeviceClient:
         self.on_status_update: Any = None
 
     async def _send(self, attr: dict) -> None:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(self._hub_ip, _HUB_PORT), timeout=_TIMEOUT
+        session = _get_hub_session(
+            self._hub_id,
+            self._hub_ip,
+            self._aes_key,
+            self._user_id,
+            self._hub_password,
         )
-        try:
-            seq = str(int(time.time() * 1000) + 1)[-9:]
-            login = json.dumps({
-                "service": "device",
-                "method": "loginReq",
-                "seq": seq,
-                "srcAddr": self._user_id,
-                "deviceId": self._hub_id,
-                "payload": {
-                    "userId": self._user_id,
-                    "password": self._hub_password,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-                    "ascNumber": 1,
-                },
-            }).encode()
-            writer.write(_frame(login, self._aes_key))
-            await writer.drain()
-
-            resp = await _recv(reader, self._aes_key)
-            asc = resp.get("payload", {}).get("ascNumber", 1) + 1
-
-            cmd = json.dumps({
-                "method": "setDevAttrReq",
-                "service": "device",
-                "clientId": "ha-" + self._user_id,
-                "srcAddr": "0." + self._user_id,
-                "seq": _next_seq(),
-                "payload": {
-                    "devId": self._device_id,
-                    "parentId": self._hub_id,
-                    "userId": self._user_id,
-                    "password": self._hub_password,
-                    "attr": attr,
-                    "channel": "ble",
-                    "ascNumber": asc,
-                },
-                "tst": int(time.time() * 1000),
-                "deviceId": self._device_id,
-            }).encode()
-            writer.write(_frame(cmd, self._aes_key))
-            await writer.drain()
-            await _recv(reader, self._aes_key)
-        finally:
-            writer.close()
+        await session.send_command(self._device_id, attr)
 
         if "OnOff" in attr:
             self.status.on = bool(attr["OnOff"])

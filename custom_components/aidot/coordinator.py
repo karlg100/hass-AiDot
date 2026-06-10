@@ -21,7 +21,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .ble_gateway_client import BleGatewayDeviceClient
+from .ble_gateway_client import BleGatewayDeviceClient, close_all_hub_sessions
 from .const import DOMAIN
 
 type AidotConfigEntry = ConfigEntry[AidotDeviceManagerCoordinator]
@@ -172,6 +172,7 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         """Perform cleanup actions."""
         for coordinator in self.device_coordinators.values():
             coordinator.device_client.on_status_update = None
+        await close_all_hub_sessions()
         await self.client.async_cleanup()
 
     def token_fresh_cb(self) -> None:
