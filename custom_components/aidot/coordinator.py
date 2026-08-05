@@ -21,6 +21,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .auth import get_login_data
 from .ble_gateway_client import BleGatewayDeviceClient, close_all_hub_sessions
 from .const import DOMAIN
 
@@ -82,12 +83,9 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             name=DOMAIN,
             update_interval=UPDATE_DEVICE_LIST_INTERVAL,
         )
-        # Unwrap old nested {"login_info": {...}} format: python-aidot 0.3.54b2 client.py
-        # references CONF_LOGIN_INFO without importing it (NameError on old-format entries).
-        token_data = config_entry.data.get("login_info", config_entry.data)
         self.client = AidotClient(
             session=async_get_clientsession(hass),
-            token=token_data,
+            token=get_login_data(config_entry.data),
         )
         self.client.set_token_fresh_cb(self.token_fresh_cb)
         self.device_coordinators: dict[str, AidotDeviceUpdateCoordinator] = {}
@@ -143,8 +141,7 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         if removed_ids:
             self._purge_deleted_lists()
 
-        # Handle both old (nested login_info) and new (flat) config entry data formats
-        login_data = self.config_entry.data.get("login_info", self.config_entry.data)
+        login_data = get_login_data(self.config_entry.data)
         user_id: str = login_data.get("id", "")
 
         for dev_id, device in current_devices.items():
