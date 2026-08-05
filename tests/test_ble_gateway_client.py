@@ -325,9 +325,10 @@ def _make_diagnostic_client() -> "bgc.BleGatewayDeviceClient":
             "serviceModules": [
                 {
                     "identity": "sensor.battery",
+                    "name": "1",
                     "properties": [
                         {
-                            "identity": "Battery",
+                            "identity": "Battery_remaining",
                             "dataType": "int",
                             "minValue": 0,
                             "maxValue": 100,
@@ -336,13 +337,16 @@ def _make_diagnostic_client() -> "bgc.BleGatewayDeviceClient":
                 },
                 {
                     "identity": "diagnostic.signal",
-                    "properties": [{"identity": "RSSI", "dataType": "int"}],
+                    "properties": [
+                        {"identity": "meshNetRssi", "dataType": "int"}
+                    ],
                 },
             ]
         },
         "properties": {
             "OnOff": 0,
-            "Battery": 86,
+            "Battery_remaining": 86,
+            "chargeState": "1",
             "ipAddress": "192.0.2.10",
             "ssidName": "Private WiFi",
         },
@@ -358,23 +362,27 @@ def _make_diagnostic_client() -> "bgc.BleGatewayDeviceClient":
 
 async def test_diagnostics_are_redacted_and_probe_advertised_attributes(monkeypatch):
     """Diagnostics retain telemetry while removing credentials and identifiers."""
+    sensitive_response = {
+        "password": "response-secret",
+        "AESKey": "response-aes-secret",
+        "houseId": "response-house-id",
+        "echo": "secret-password",
+        "echoName": "Back Garden",
+    }
     server = FakeServer(
         [
             {
                 "frames": [
                     _login_frame(),
-                    _attr_frame(
-                        {
-                            "Battery": 87,
-                            "RSSI": -61,
-                            "password": "response-secret",
-                            "AESKey": "response-aes-secret",
-                            "houseId": "response-house-id",
-                            "echo": "secret-password",
-                        }
-                    ),
+                    _attr_frame({"Battery_remaining": 87, **sensitive_response}),
                 ]
-            }
+            },
+            {
+                "frames": [
+                    _login_frame(),
+                    _attr_frame({"chargeState": 1, **sensitive_response}),
+                ]
+            },
         ]
     )
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
@@ -382,15 +390,32 @@ async def test_diagnostics_are_redacted_and_probe_advertised_attributes(monkeypa
     diagnostics = await _make_diagnostic_client().async_get_diagnostics()
     encoded = json.dumps(diagnostics)
 
-    assert diagnostics["requestedAttributes"] == ["Battery", "OnOff", "RSSI"]
-    assert diagnostics["cloud"]["properties"]["Battery"] == 86
+    assert diagnostics["requestedAttributes"] == [
+        "Battery_remaining",
+        "OnOff",
+        "chargeState",
+        "meshNetRssi",
+    ]
+    assert len(diagnostics["anonymousDeviceId"]) == 12
+    assert diagnostics["cloud"]["properties"]["Battery_remaining"] == 86
+    assert diagnostics["cloud"]["properties"]["chargeState"] == "1"
+    assert diagnostics["cloud"]["serviceModules"][0]["identity"] == "sensor.battery"
+    assert diagnostics["cloud"]["serviceModules"][0]["name"] == "1"
     assert diagnostics["cloud"]["properties"]["ipAddress"] == bgc._REDACTED
-    assert diagnostics["probe"]["responses"][0]["payload"]["attr"]["Battery"] == 87
-    response_attr = diagnostics["probe"]["responses"][0]["payload"]["attr"]
+    assert diagnostics["probe"]["status"] == "success"
+    assert len(diagnostics["probe"]["targets"]) == 2
+    battery_target = next(
+        target
+        for target in diagnostics["probe"]["targets"]
+        if target["attribute"] == "Battery_remaining"
+    )
+    response_attr = battery_target["responses"][0]["payload"]["attr"]
+    assert response_attr["Battery_remaining"] == 87
     assert response_attr["password"] == bgc._REDACTED
     assert response_attr["AESKey"] == bgc._REDACTED
     assert response_attr["houseId"] == bgc._REDACTED
     assert response_attr["echo"] == bgc._REDACTED
+    assert response_attr["echoName"] == bgc._REDACTED
     for secret in (
         "secret-device-id",
         "AA:BB:CC:DD:EE:FF",
@@ -408,6 +433,113 @@ async def test_diagnostics_are_redacted_and_probe_advertised_attributes(monkeypa
         assert secret not in encoded
 
 
+def test_cloud_telemetry_initializes_and_refreshes() -> None:
+    """Battery, mesh RSSI, and charge state follow refreshed cloud properties."""
+    device = {
+        "id": "devA",
+        "mac": "AA:BB",
+        "name": "Spot 1",
+        "product": {
+            "serviceModules": [
+                {
+                    "identity": "control.light.effect.mode",
+                    "properties": [
+                        {
+                            "identity": "EffectMode",
+                            "allowedValues": [
+                                {"description": "party", "value": 5},
+                                {"description": "bonfire", "value": 10},
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        "properties": {
+            "Battery_remaining": "65",
+            "meshNetRssi": "-40",
+            "chargeState": "1",
+            "energySavingEnable": "1",
+            "energySavingFactor": "0.8",
+            "lightDuration": "30",
+            "SecurityAlarm": "2",
+            "alarmStatus": "0",
+            "EffectMode": "5",
+        },
+    }
+    hub = {
+        "id": "hub1",
+        "password": "pw",
+        "aesKey": ["testkey"],
+        "properties": {"ipAddress": "10.0.0.5"},
+    }
+    client = bgc.BleGatewayDeviceClient(device, hub, "user1")
+    seen = []
+    client.on_status_update = seen.append
+
+    assert client.status.battery == 65
+    assert client.status.mesh_rssi == -40
+    assert client.status.charging is True
+    assert client.status.energy_saving_enabled is True
+    assert client.status.energy_saving_factor == 80
+    assert client.status.light_duration == 30
+    assert client.status.security_alarm is True
+    assert client.status.alarm_status is False
+    assert client.status.effect_mode == 5
+    assert client.info.effects == {"Party": 5, "Bonfire": 10}
+
+    client.update_cloud_properties(
+        {
+            **device,
+            "properties": {
+                "Battery_remaining": "54",
+                "meshNetRssi": "-67",
+                "chargeState": "0",
+            },
+        }
+    )
+
+    assert client.status.battery == 54
+    assert client.status.mesh_rssi == -67
+    assert client.status.charging is False
+    assert seen and seen[-1] is client.status
+
+
+async def test_live_battery_refresh_updates_freshness(monkeypatch) -> None:
+    """A live battery response replaces cloud data and records freshness."""
+    server = FakeServer(
+        [{"frames": [_login_frame(), _attr_frame({"Battery_remaining": 34})]}]
+    )
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    client = _make_diagnostic_client()
+    await client.async_refresh_telemetry()
+
+    assert client.status.battery == 34
+    assert client.status.telemetry_connected is True
+    assert client.status.last_telemetry_update is not None
+
+
+async def test_three_missed_live_polls_mark_telemetry_disconnected(monkeypatch) -> None:
+    """Sleeping lights keep their battery value but eventually report no telemetry."""
+    server = FakeServer(
+        [
+            {"frames": [_login_frame(), _ack_frame()]},
+            {"frames": [_login_frame(), _ack_frame()]},
+            {"frames": [_login_frame(), _ack_frame()]},
+        ]
+    )
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    client = _make_diagnostic_client()
+    original_battery = client.status.battery
+    for _ in range(bgc._MAX_MISSED_TELEMETRY_POLLS):
+        await client.async_refresh_telemetry()
+
+    assert client.status.battery == original_battery
+    assert client.status.telemetry_connected is False
+
+
 async def test_optimistic_status_updates_after_command(monkeypatch):
     """async_set_brightness still updates cached status and fires the callback."""
     server = FakeServer([{"frames": [_login_frame(), _ack_frame()]}])
@@ -422,3 +554,21 @@ async def test_optimistic_status_updates_after_command(monkeypatch):
     assert client.status.on is True
     assert client.status.dimming == 255
     assert seen and seen[-1] is client.status
+
+
+async def test_effect_command_updates_cached_mode(monkeypatch):
+    """BLE effect commands use EffectMode and update coordinator memory."""
+    server = FakeServer([{"frames": [_login_frame(), _ack_frame()]}])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    client = _make_client()
+    await client.async_set_effect(10)
+
+    request = next(
+        json.loads(bgc._aes_decrypt(data[8:], KEY))
+        for data in server.writers[0].writes
+        if json.loads(bgc._aes_decrypt(data[8:], KEY)).get("method")
+        == "setDevAttrReq"
+    )
+    assert request["payload"]["attr"] == {"OnOff": 1, "EffectMode": 10}
+    assert client.status.effect_mode == 10

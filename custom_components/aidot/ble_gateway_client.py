@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import struct
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from aidot.aes_utils import aes_encrypt as _aes_encrypt_raw, aes_decrypt as _aes_decrypt_raw
@@ -39,7 +40,6 @@ _DIAGNOSTIC_REDACT_KEYS = {
     "lon",
     "longitude",
     "mac",
-    "name",
     "parentid",
     "password",
     "refreshtoken",
@@ -58,6 +58,18 @@ _DIAGNOSTIC_REDACT_TERMS = (
     "token",
 )
 _REDACTED = "**REDACTED**"
+_DIAGNOSTIC_PROBE_ATTRIBUTES = (
+    "chargeState",
+    "meshNetRssi",
+    "DetectionMode",
+    "energySavingEnable",
+    "energySavingFactor",
+    "lightDuration",
+    "SecurityAlarm",
+    "alarmStatus",
+    "EffectMode",
+)
+_MAX_MISSED_TELEMETRY_POLLS = 3
 
 
 def _make_aes_key(key_str: str) -> bytes:
@@ -156,6 +168,60 @@ def _diagnostic_attributes(device: dict[str, Any]) -> list[str]:
     return sorted(attributes)
 
 
+def _parse_int(value: Any, minimum: int, maximum: int) -> int | None:
+    """Return an integer within a known telemetry range."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minimum <= parsed <= maximum:
+        return parsed
+    return None
+
+
+def _parse_bool(value: Any) -> bool | None:
+    """Return a boolean for the common AiDot 0/1 representation."""
+    parsed = _parse_int(value, 0, 1)
+    return bool(parsed) if parsed is not None else None
+
+
+def _parse_alarm(value: Any) -> bool | None:
+    """Treat any non-zero alarm code as active."""
+    parsed = _parse_int(value, 0, 9999999999)
+    return bool(parsed) if parsed is not None else None
+
+
+def _parse_percentage_factor(value: Any) -> int | None:
+    """Convert either a 0-1 factor or 0-100 value to a percentage."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= parsed <= 1:
+        parsed *= 100
+    if 0 <= parsed <= 100:
+        return round(parsed)
+    return None
+
+
+def _effect_codes(device: dict[str, Any]) -> dict[str, int]:
+    """Return effect names and codes advertised by the product metadata."""
+    effects: dict[str, int] = {}
+    for module in device.get("product", {}).get("serviceModules", []):
+        if module.get("identity") != "control.light.effect.mode":
+            continue
+        for prop in module.get("properties", []):
+            for option in prop.get("allowedValues", []):
+                code = _parse_int(option.get("value"), 0, 65535)
+                if code is None:
+                    continue
+                name = option.get("description") or option.get("name")
+                if not isinstance(name, str) or not name.strip():
+                    name = f"Effect {code}"
+                effects[name.strip().title()] = code
+    return effects
+
+
 @dataclass
 class BleDeviceInfo:
     dev_id: str
@@ -165,6 +231,7 @@ class BleDeviceInfo:
     hw_version: str | None
     enable_rgbw: bool
     enable_cct: bool
+    effects: dict[str, int] = field(default_factory=dict)
     cct_min: int = 2700
     cct_max: int = 6500
 
@@ -176,6 +243,18 @@ class BleDeviceStatus:
     dimming: int = 255
     cct: int = 2700
     rgbw: tuple[int, int, int, int] = field(default_factory=lambda: (255, 255, 255, 0))
+    battery: int | None = None
+    mesh_rssi: int | None = None
+    charging: bool | None = None
+    telemetry_connected: bool | None = None
+    last_telemetry_update: datetime | None = None
+    energy_saving_enabled: bool | None = None
+    energy_saving_factor: int | None = None
+    light_duration: int | None = None
+    detection_mode: int | None = None
+    security_alarm: bool | None = None
+    alarm_status: bool | None = None
+    effect_mode: int | None = None
 
 
 _seq = 0
@@ -381,6 +460,9 @@ class BleGatewayDeviceClient:
         self._hub_ip: str = hub_device.get("properties", {}).get("ipAddress", "")
         self._hub_password: str = hub_device.get("password", "")
         self._user_id: str = user_id
+        self._missed_telemetry_polls = 0
+        self._telemetry_extra_index = 0
+        self._diagnostic_id = hashlib.sha256(self._device_id.encode()).hexdigest()[:12]
         self._aes_key: bytes = _make_aes_key(
             (hub_device.get("aesKey") or [None])[0] or ""
         )
@@ -390,6 +472,11 @@ class BleGatewayDeviceClient:
                 "hub": hub_device,
                 "userId": user_id,
             }
+        )
+        self._diagnostic_secrets.update(
+            value
+            for value in (device.get("name"), hub_device.get("name"))
+            if isinstance(value, str) and value
         )
         self._diagnostic_attributes = _diagnostic_attributes(device)
         self._diagnostic_cloud_data = _redact_diagnostics(
@@ -432,6 +519,7 @@ class BleGatewayDeviceClient:
             hw_version=device.get("hardwareVersion"),
             enable_rgbw=enable_rgbw,
             enable_cct=enable_cct,
+            effects=_effect_codes(device),
             cct_min=cct_min,
             cct_max=cct_max,
         )
@@ -452,13 +540,147 @@ class BleGatewayDeviceClient:
                 (rgbw_u >> 8) & 0xFF,
                 rgbw_u & 0xFF,
             ),
+            battery=_parse_int(props.get("Battery_remaining"), 0, 100),
+            mesh_rssi=_parse_int(props.get("meshNetRssi"), -127, 20),
+            charging=_parse_bool(props.get("chargeState")),
+            energy_saving_enabled=_parse_bool(props.get("energySavingEnable")),
+            energy_saving_factor=_parse_percentage_factor(
+                props.get("energySavingFactor")
+            ),
+            light_duration=_parse_int(props.get("lightDuration"), 0, 86400),
+            detection_mode=_parse_int(props.get("DetectionMode"), 0, 65535),
+            security_alarm=_parse_alarm(props.get("SecurityAlarm")),
+            alarm_status=_parse_alarm(props.get("alarmStatus")),
+            effect_mode=_parse_int(props.get("EffectMode"), 0, 65535),
         )
         self.on_status_update: Any = None
 
+    def update_cloud_properties(self, device: dict[str, Any]) -> None:
+        """Update cached telemetry from a refreshed AiDot cloud device record."""
+        props = device.get("properties", {})
+        self.status.battery = _parse_int(props.get("Battery_remaining"), 0, 100)
+        self.status.mesh_rssi = _parse_int(props.get("meshNetRssi"), -127, 20)
+        self.status.charging = _parse_bool(props.get("chargeState"))
+        self.status.energy_saving_enabled = _parse_bool(
+            props.get("energySavingEnable")
+        )
+        self.status.energy_saving_factor = _parse_percentage_factor(
+            props.get("energySavingFactor")
+        )
+        self.status.light_duration = _parse_int(
+            props.get("lightDuration"), 0, 86400
+        )
+        self.status.detection_mode = _parse_int(
+            props.get("DetectionMode"), 0, 65535
+        )
+        self.status.security_alarm = _parse_alarm(props.get("SecurityAlarm"))
+        self.status.alarm_status = _parse_alarm(props.get("alarmStatus"))
+        self.status.effect_mode = _parse_int(props.get("EffectMode"), 0, 65535)
+        self._diagnostic_attributes = _diagnostic_attributes(device)
+        self._diagnostic_cloud_data["properties"] = _redact_diagnostics(
+            props, self._diagnostic_secrets
+        )
+        if self.on_status_update:
+            self.on_status_update(self.status)
+
+    def supports_telemetry_attribute(self, attribute: str) -> bool:
+        """Return whether cloud metadata advertises a telemetry attribute."""
+        return attribute in self._diagnostic_attributes
+
+    def _apply_telemetry_attributes(self, attributes: dict[str, Any]) -> bool:
+        """Apply recognized live attributes and report whether any were valid."""
+        received = False
+        parsers = {
+            "Battery_remaining": ("battery", lambda value: _parse_int(value, 0, 100)),
+            "meshNetRssi": ("mesh_rssi", lambda value: _parse_int(value, -127, 20)),
+            "chargeState": ("charging", _parse_bool),
+            "energySavingEnable": ("energy_saving_enabled", _parse_bool),
+            "energySavingFactor": (
+                "energy_saving_factor",
+                _parse_percentage_factor,
+            ),
+            "lightDuration": (
+                "light_duration",
+                lambda value: _parse_int(value, 0, 86400),
+            ),
+            "DetectionMode": (
+                "detection_mode",
+                lambda value: _parse_int(value, 0, 65535),
+            ),
+            "SecurityAlarm": ("security_alarm", _parse_alarm),
+            "alarmStatus": ("alarm_status", _parse_alarm),
+            "EffectMode": (
+                "effect_mode",
+                lambda value: _parse_int(value, 0, 65535),
+            ),
+        }
+        for attribute, (status_key, parser) in parsers.items():
+            if attribute not in attributes:
+                continue
+            value = parser(attributes[attribute])
+            if value is None:
+                continue
+            setattr(self.status, status_key, value)
+            received = True
+        return received
+
+    async def async_refresh_telemetry(self) -> None:
+        """Refresh battery without treating a sleeping mesh light as offline."""
+        extra_attributes = [
+            attr
+            for attr in _DIAGNOSTIC_PROBE_ATTRIBUTES
+            if attr in self._diagnostic_attributes
+        ]
+        targets = ["Battery_remaining"]
+        if extra_attributes:
+            targets.append(
+                extra_attributes[
+                    self._telemetry_extra_index % len(extra_attributes)
+                ]
+            )
+            self._telemetry_extra_index += 1
+
+        received = False
+        for attribute in dict.fromkeys(targets):
+            session = _get_hub_session(
+                self._hub_id,
+                self._hub_ip,
+                self._aes_key,
+                self._user_id,
+                self._hub_password,
+            )
+            try:
+                responses = await session.get_attributes(
+                    self._device_id, [attribute]
+                )
+            except Exception:  # noqa: BLE001 - a sleeping mesh light is expected
+                responses = []
+
+            for response in responses:
+                payload = response.get("payload")
+                if not isinstance(payload, dict) or not isinstance(
+                    payload.get("attr"), dict
+                ):
+                    continue
+                received |= self._apply_telemetry_attributes(payload["attr"])
+
+        if received:
+            self._missed_telemetry_polls = 0
+            self.status.telemetry_connected = True
+            self.status.last_telemetry_update = datetime.now(UTC)
+        else:
+            self._missed_telemetry_polls += 1
+            if self._missed_telemetry_polls >= _MAX_MISSED_TELEMETRY_POLLS:
+                self.status.telemetry_connected = False
+
+        if self.on_status_update:
+            self.on_status_update(self.status)
+
     async def async_get_diagnostics(self) -> dict[str, Any]:
-        """Return redacted cloud metadata and a one-shot BLE attribute probe."""
+        """Return redacted cloud metadata and targeted BLE attribute probes."""
         diagnostics: dict[str, Any] = {
             "transport": "ble_mesh_gateway",
+            "anonymousDeviceId": self._diagnostic_id,
             "cloud": self._diagnostic_cloud_data,
             "requestedAttributes": self._diagnostic_attributes,
         }
@@ -469,30 +691,52 @@ class BleGatewayDeviceClient:
             diagnostics["probe"] = {"status": "skipped_no_hub_ip"}
             return diagnostics
 
-        session = _get_hub_session(
-            self._hub_id,
-            self._hub_ip,
-            self._aes_key,
-            self._user_id,
-            self._hub_password,
-        )
-        try:
-            responses = await session.get_attributes(
-                self._device_id, self._diagnostic_attributes
+        extra_attributes = [
+            attr
+            for attr in _DIAGNOSTIC_PROBE_ATTRIBUTES
+            if attr in self._diagnostic_attributes
+        ]
+        targets = ["Battery_remaining"]
+        if extra_attributes:
+            target_index = int(self._diagnostic_id, 16) % len(extra_attributes)
+            targets.append(extra_attributes[target_index])
+
+        target_results: list[dict[str, Any]] = []
+        for attribute in dict.fromkeys(targets):
+            session = _get_hub_session(
+                self._hub_id,
+                self._hub_ip,
+                self._aes_key,
+                self._user_id,
+                self._hub_password,
             )
-        # Diagnostics must remain downloadable when a light or hub is offline.
-        except Exception as error:  # noqa: BLE001
-            diagnostics["probe"] = {
-                "status": "error",
-                "errorType": type(error).__name__,
-            }
-        else:
-            diagnostics["probe"] = {
-                "status": "success",
-                "responses": _redact_diagnostics(
-                    responses, self._diagnostic_secrets
-                ),
-            }
+            try:
+                responses = await session.get_attributes(
+                    self._device_id, [attribute]
+                )
+            # Diagnostics must remain downloadable when a light or hub is offline.
+            except Exception as error:  # noqa: BLE001
+                target_results.append(
+                    {
+                        "attribute": attribute,
+                        "status": "error",
+                        "errorType": type(error).__name__,
+                    }
+                )
+            else:
+                target_results.append(
+                    {
+                        "attribute": attribute,
+                        "status": "success",
+                        "responses": _redact_diagnostics(
+                            responses, self._diagnostic_secrets
+                        ),
+                    }
+                )
+        diagnostics["probe"] = {
+            "status": "success",
+            "targets": target_results,
+        }
         return diagnostics
 
     async def _send(self, attr: dict) -> None:
@@ -519,6 +763,8 @@ class BleGatewayDeviceClient:
                 (packed >> 8) & 0xFF,
                 packed & 0xFF,
             )
+        if "EffectMode" in attr:
+            self.status.effect_mode = int(attr["EffectMode"])
         if self.on_status_update:
             self.on_status_update(self.status)
 
@@ -537,3 +783,6 @@ class BleGatewayDeviceClient:
 
     async def async_set_cct(self, cct: int) -> None:
         await self._send({"OnOff": 1, "CCT": cct})
+
+    async def async_set_effect(self, effect: int) -> None:
+        await self._send({"OnOff": 1, "EffectMode": effect})
