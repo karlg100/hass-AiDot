@@ -15,8 +15,49 @@ from aidot.aes_utils import aes_encrypt as _aes_encrypt_raw, aes_decrypt as _aes
 
 _HUB_PORT = 10000
 _TIMEOUT = 8
+_DIAGNOSTIC_FOLLOWUP_TIMEOUT = 1
 _MAX_RETRIES = 3
 _BACKOFF = 0.5
+
+_DIAGNOSTIC_REDACT_KEYS = {
+    "accesstoken",
+    "aeskey",
+    "area",
+    "blemeshdevicekey",
+    "city",
+    "citytimezone",
+    "clientid",
+    "deviceid",
+    "devid",
+    "directgateway",
+    "email",
+    "houseid",
+    "id",
+    "ipaddress",
+    "lat",
+    "latitude",
+    "lon",
+    "longitude",
+    "mac",
+    "name",
+    "parentid",
+    "password",
+    "refreshtoken",
+    "roomid",
+    "spaceid",
+    "srcaddr",
+    "ssidname",
+    "token",
+    "userid",
+    "username",
+}
+_DIAGNOSTIC_REDACT_TERMS = (
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
+_REDACTED = "**REDACTED**"
 
 
 def _make_aes_key(key_str: str) -> bytes:
@@ -39,12 +80,80 @@ def _frame(msg: bytes, key: bytes) -> bytes:
     return struct.pack(">Hhi", 0x1EED, 1, len(enc)) + enc
 
 
-async def _recv(reader: asyncio.StreamReader, key: bytes) -> dict:
-    hdr = await asyncio.wait_for(reader.readexactly(8), timeout=_TIMEOUT)
+async def _recv(
+    reader: asyncio.StreamReader, key: bytes, timeout: float = _TIMEOUT
+) -> dict:
+    hdr = await asyncio.wait_for(reader.readexactly(8), timeout=timeout)
     _, _, size = struct.unpack(">HHI", hdr)
-    body = await asyncio.wait_for(reader.readexactly(size), timeout=_TIMEOUT)
+    body = await asyncio.wait_for(reader.readexactly(size), timeout=timeout)
     raw = _aes_decrypt_raw(body, key)
     return json.loads(raw)
+
+
+def _is_diagnostic_sensitive_key(key: object) -> bool:
+    """Return whether a diagnostic mapping key may identify or authenticate."""
+    key_lower = str(key).lower()
+    return (
+        key_lower in _DIAGNOSTIC_REDACT_KEYS
+        or key_lower.endswith("key")
+        or any(term in key_lower for term in _DIAGNOSTIC_REDACT_TERMS)
+    )
+
+
+def _diagnostic_secret_values(value: Any, sensitive: bool = False) -> set[str]:
+    """Collect string values stored below sensitive mapping keys."""
+    secrets: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            secrets.update(
+                _diagnostic_secret_values(
+                    item, sensitive=sensitive or _is_diagnostic_sensitive_key(key)
+                )
+            )
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            secrets.update(_diagnostic_secret_values(item, sensitive=sensitive))
+    elif sensitive and isinstance(value, str) and value:
+        secrets.add(value)
+    return secrets
+
+
+def _redact_diagnostics(
+    value: Any, sensitive_values: set[str] | None = None
+) -> Any:
+    """Recursively redact credentials and identifiers from diagnostic data."""
+    sensitive_values = sensitive_values or set()
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if _is_diagnostic_sensitive_key(key_text):
+                redacted[key_text] = _REDACTED
+            else:
+                redacted[key_text] = _redact_diagnostics(item, sensitive_values)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_diagnostics(item, sensitive_values) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_diagnostics(item, sensitive_values) for item in value)
+    if isinstance(value, str) and value in sensitive_values:
+        return _REDACTED
+    return value
+
+
+def _diagnostic_attributes(device: dict[str, Any]) -> list[str]:
+    """Return readable attribute names advertised for a BLE mesh device."""
+    attributes = {
+        str(key)
+        for key in device.get("properties", {})
+        if not _is_diagnostic_sensitive_key(key)
+    }
+    for module in device.get("product", {}).get("serviceModules", []):
+        for prop in module.get("properties", []):
+            identity = prop.get("identity")
+            if isinstance(identity, str) and identity:
+                attributes.add(identity)
+    return sorted(attributes)
 
 
 @dataclass
@@ -124,6 +233,29 @@ class _HubSession:
                         raise
                     await asyncio.sleep(_BACKOFF * (attempt + 1))
 
+    async def get_attributes(self, dev_id: str, attr: list[str]) -> list[dict]:
+        """Read BLE attributes once, returning all immediate hub responses."""
+        async with self._lock:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    await self._ensure_connected()
+                    return await self._send_get_attr(dev_id, attr)
+                except (
+                    ConnectionError,
+                    asyncio.TimeoutError,
+                    asyncio.IncompleteReadError,
+                ):
+                    await self._close()
+                    if attempt == _MAX_RETRIES - 1:
+                        raise
+                    await asyncio.sleep(_BACKOFF * (attempt + 1))
+                finally:
+                    # A one-shot diagnostic read may leave delayed notification
+                    # frames behind. Close it so the next control command starts
+                    # with a clean, newly authenticated stream.
+                    await self._close()
+        return []
+
     async def _ensure_connected(self) -> None:
         if self._writer is None or self._writer.is_closing():
             await self._connect_and_login()
@@ -152,8 +284,43 @@ class _HubSession:
         self._asc = resp.get("payload", {}).get("ascNumber", 1) + 1
 
     async def _send_set_attr(self, dev_id: str, attr: dict) -> None:
+        cmd = self._make_attr_request("setDevAttrReq", dev_id, attr)
+        self._writer.write(_frame(cmd, self._aes_key))
+        await self._writer.drain()
+        await _recv(self._reader, self._aes_key)
+
+    async def _send_get_attr(self, dev_id: str, attr: list[str]) -> list[dict]:
+        cmd = self._make_attr_request("getDevAttrReq", dev_id, attr)
+        self._writer.write(_frame(cmd, self._aes_key))
+        await self._writer.drain()
+
+        responses = [await _recv(self._reader, self._aes_key)]
+        if not any(
+            isinstance(response.get("payload"), dict)
+            and response["payload"].get("attr")
+            for response in responses
+        ):
+            try:
+                responses.append(
+                    await _recv(
+                        self._reader,
+                        self._aes_key,
+                        timeout=_DIAGNOSTIC_FOLLOWUP_TIMEOUT,
+                    )
+                )
+            except (
+                ConnectionError,
+                asyncio.TimeoutError,
+                asyncio.IncompleteReadError,
+            ):
+                pass
+        return responses
+
+    def _make_attr_request(
+        self, method: str, dev_id: str, attr: dict | list[str]
+    ) -> bytes:
         cmd = json.dumps({
-            "method": "setDevAttrReq",
+            "method": method,
             "service": "device",
             "clientId": "ha-" + self._user_id,
             "srcAddr": "0." + self._user_id,
@@ -171,9 +338,7 @@ class _HubSession:
             "deviceId": dev_id,
         }).encode()
         self._asc += 1
-        self._writer.write(_frame(cmd, self._aes_key))
-        await self._writer.drain()
-        await _recv(self._reader, self._aes_key)
+        return cmd
 
     async def _close(self) -> None:
         writer = self._writer
@@ -218,6 +383,27 @@ class BleGatewayDeviceClient:
         self._user_id: str = user_id
         self._aes_key: bytes = _make_aes_key(
             (hub_device.get("aesKey") or [None])[0] or ""
+        )
+        self._diagnostic_secrets = _diagnostic_secret_values(
+            {
+                "device": device,
+                "hub": hub_device,
+                "userId": user_id,
+            }
+        )
+        self._diagnostic_attributes = _diagnostic_attributes(device)
+        self._diagnostic_cloud_data = _redact_diagnostics(
+            {
+                "modelId": device.get("modelId"),
+                "hardwareVersion": device.get("hardwareVersion"),
+                "simpleVersion": device.get("simpleVersion"),
+                "type": device.get("type"),
+                "properties": device.get("properties", {}),
+                "serviceModules": device.get("product", {}).get(
+                    "serviceModules", []
+                ),
+            },
+            self._diagnostic_secrets,
         )
 
         modules = {
@@ -268,6 +454,46 @@ class BleGatewayDeviceClient:
             ),
         )
         self.on_status_update: Any = None
+
+    async def async_get_diagnostics(self) -> dict[str, Any]:
+        """Return redacted cloud metadata and a one-shot BLE attribute probe."""
+        diagnostics: dict[str, Any] = {
+            "transport": "ble_mesh_gateway",
+            "cloud": self._diagnostic_cloud_data,
+            "requestedAttributes": self._diagnostic_attributes,
+        }
+        if not self._diagnostic_attributes:
+            diagnostics["probe"] = {"status": "skipped_no_attributes"}
+            return diagnostics
+        if not self._hub_ip:
+            diagnostics["probe"] = {"status": "skipped_no_hub_ip"}
+            return diagnostics
+
+        session = _get_hub_session(
+            self._hub_id,
+            self._hub_ip,
+            self._aes_key,
+            self._user_id,
+            self._hub_password,
+        )
+        try:
+            responses = await session.get_attributes(
+                self._device_id, self._diagnostic_attributes
+            )
+        # Diagnostics must remain downloadable when a light or hub is offline.
+        except Exception as error:  # noqa: BLE001
+            diagnostics["probe"] = {
+                "status": "error",
+                "errorType": type(error).__name__,
+            }
+        else:
+            diagnostics["probe"] = {
+                "status": "success",
+                "responses": _redact_diagnostics(
+                    responses, self._diagnostic_secrets
+                ),
+            }
+        return diagnostics
 
     async def _send(self, attr: dict) -> None:
         session = _get_hub_session(

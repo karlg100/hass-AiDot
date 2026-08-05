@@ -113,6 +113,10 @@ def _ack_frame() -> bytes:
     return _frame_obj({"payload": {}})
 
 
+def _attr_frame(attr: dict) -> bytes:
+    return _frame_obj({"payload": {"attr": attr}})
+
+
 def _session() -> "bgc._HubSession":
     return bgc._HubSession(
         hub_id="hub1",
@@ -199,6 +203,48 @@ async def test_ascnumber_increments_per_command(monkeypatch):
     assert ascs == [6, 7], f"expected ascNumber 6,7 got {ascs}"
 
 
+async def test_get_attributes_uses_ble_channel_and_returns_telemetry(monkeypatch):
+    """A diagnostic read sends getDevAttrReq and returns the attribute payload."""
+    server = FakeServer(
+        [{"frames": [_login_frame(), _attr_frame({"Battery": 87, "RSSI": -61})]}]
+    )
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    sess = _session()
+    responses = await sess.get_attributes("devA", ["Battery", "RSSI"])
+
+    messages = [
+        json.loads(bgc._aes_decrypt(data[8:], KEY))
+        for data in server.writers[0].writes
+    ]
+    request = next(msg for msg in messages if msg.get("method") == "getDevAttrReq")
+    assert request["payload"]["channel"] == "ble"
+    assert request["payload"]["attr"] == ["Battery", "RSSI"]
+    assert responses[0]["payload"]["attr"] == {"Battery": 87, "RSSI": -61}
+    assert server.writers[0].is_closing()
+
+
+async def test_get_attributes_collects_ack_and_followup_telemetry(monkeypatch):
+    """The hub may acknowledge first and send the attribute payload second."""
+    server = FakeServer(
+        [
+            {
+                "frames": [
+                    _login_frame(),
+                    _ack_frame(),
+                    _attr_frame({"Battery": 54}),
+                ]
+            }
+        ]
+    )
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    responses = await _session().get_attributes("devA", ["Battery"])
+
+    assert len(responses) == 2
+    assert responses[1]["payload"]["attr"]["Battery"] == 54
+
+
 async def test_retry_reconnects_after_reset(monkeypatch):
     """A transient reset on the first attempt triggers reconnect + relogin."""
     monkeypatch.setattr(bgc, "_BACKOFF", 0)
@@ -264,6 +310,102 @@ def _make_client() -> "bgc.BleGatewayDeviceClient":
         "properties": {"ipAddress": "10.0.0.5"},
     }
     return bgc.BleGatewayDeviceClient(device, hub, "user1")
+
+
+def _make_diagnostic_client() -> "bgc.BleGatewayDeviceClient":
+    device = {
+        "id": "secret-device-id",
+        "mac": "AA:BB:CC:DD:EE:FF",
+        "name": "Back Garden",
+        "modelId": "LK.A000181",
+        "hardwareVersion": "1.0",
+        "type": "light",
+        "bleMeshDeviceKey": "secret-mesh-key",
+        "product": {
+            "serviceModules": [
+                {
+                    "identity": "sensor.battery",
+                    "properties": [
+                        {
+                            "identity": "Battery",
+                            "dataType": "int",
+                            "minValue": 0,
+                            "maxValue": 100,
+                        }
+                    ],
+                },
+                {
+                    "identity": "diagnostic.signal",
+                    "properties": [{"identity": "RSSI", "dataType": "int"}],
+                },
+            ]
+        },
+        "properties": {
+            "OnOff": 0,
+            "Battery": 86,
+            "ipAddress": "192.0.2.10",
+            "ssidName": "Private WiFi",
+        },
+    }
+    hub = {
+        "id": "secret-hub-id",
+        "password": "secret-password",
+        "aesKey": ["testkey"],
+        "properties": {"ipAddress": "10.0.0.5"},
+    }
+    return bgc.BleGatewayDeviceClient(device, hub, "secret-user-id")
+
+
+async def test_diagnostics_are_redacted_and_probe_advertised_attributes(monkeypatch):
+    """Diagnostics retain telemetry while removing credentials and identifiers."""
+    server = FakeServer(
+        [
+            {
+                "frames": [
+                    _login_frame(),
+                    _attr_frame(
+                        {
+                            "Battery": 87,
+                            "RSSI": -61,
+                            "password": "response-secret",
+                            "AESKey": "response-aes-secret",
+                            "houseId": "response-house-id",
+                            "echo": "secret-password",
+                        }
+                    ),
+                ]
+            }
+        ]
+    )
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    diagnostics = await _make_diagnostic_client().async_get_diagnostics()
+    encoded = json.dumps(diagnostics)
+
+    assert diagnostics["requestedAttributes"] == ["Battery", "OnOff", "RSSI"]
+    assert diagnostics["cloud"]["properties"]["Battery"] == 86
+    assert diagnostics["cloud"]["properties"]["ipAddress"] == bgc._REDACTED
+    assert diagnostics["probe"]["responses"][0]["payload"]["attr"]["Battery"] == 87
+    response_attr = diagnostics["probe"]["responses"][0]["payload"]["attr"]
+    assert response_attr["password"] == bgc._REDACTED
+    assert response_attr["AESKey"] == bgc._REDACTED
+    assert response_attr["houseId"] == bgc._REDACTED
+    assert response_attr["echo"] == bgc._REDACTED
+    for secret in (
+        "secret-device-id",
+        "AA:BB:CC:DD:EE:FF",
+        "Back Garden",
+        "secret-mesh-key",
+        "Private WiFi",
+        "secret-hub-id",
+        "secret-password",
+        "testkey",
+        "secret-user-id",
+        "response-secret",
+        "response-aes-secret",
+        "response-house-id",
+    ):
+        assert secret not in encoded
 
 
 async def test_optimistic_status_updates_after_command(monkeypatch):
