@@ -5,6 +5,7 @@ from typing import Any
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
     ATTR_RGBW_COLOR,
     ColorMode,
     LightEntity,
@@ -59,6 +60,10 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
             name=coordinator.device_client.info.name,
             hw_version=coordinator.device_client.info.hw_version,
         )
+        self._effect_codes = getattr(coordinator.device_client.info, "effects", {})
+        self._effect_names = {code: name for name, code in self._effect_codes.items()}
+        if self._effect_codes:
+            self._attr_effect_list = list(self._effect_codes)
         if coordinator.device_client.info.enable_rgbw:
             self._attr_color_mode = ColorMode.RGBW
             self._attr_supported_color_modes = {ColorMode.RGBW, ColorMode.COLOR_TEMP}
@@ -76,6 +81,9 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         self._attr_brightness = self.coordinator.data.dimming
         self._attr_color_temp_kelvin = self.coordinator.data.cct
         self._attr_rgbw_color = self.coordinator.data.rgbw
+        self._attr_effect = self._effect_names.get(
+            getattr(self.coordinator.data, "effect_mode", None)
+        )
 
     @property
     def available(self) -> bool:
@@ -107,6 +115,12 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
             self.coordinator.data.rgbw = rgbw_color
             self._attr_rgbw_color = rgbw_color
             self._attr_color_mode = ColorMode.RGBW
+        elif ATTR_EFFECT in kwargs:
+            effect = kwargs[ATTR_EFFECT]
+            await self.coordinator.device_client.async_set_effect(
+                self._effect_codes[effect]
+            )
+            self._attr_effect = effect
         else:
             await self.coordinator.device_client.async_turn_on()
 

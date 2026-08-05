@@ -5,7 +5,11 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import AidotConfigEntry, AidotDeviceManagerCoordinator
 
-PLATFORMS: list[Platform] = [Platform.LIGHT]
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.LIGHT,
+    Platform.SENSOR,
+]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: AidotConfigEntry) -> bool:
