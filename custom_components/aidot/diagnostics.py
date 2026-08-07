@@ -13,7 +13,7 @@ from .coordinator import AidotConfigEntry
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: AidotConfigEntry
 ) -> dict[str, Any]:
-    """Return redacted diagnostics, including one-shot BLE telemetry probes."""
+    """Return redacted passive BLE listener diagnostics."""
     del hass
     devices: list[dict[str, Any]] = []
     for coordinator in entry.runtime_data.device_coordinators.values():

@@ -6,19 +6,27 @@ import asyncio
 import ctypes
 import hashlib
 import json
+import logging
 import struct
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Callable
 
-from aidot.aes_utils import aes_encrypt as _aes_encrypt_raw, aes_decrypt as _aes_decrypt_raw
+from aidot.aes_utils import (
+    aes_decrypt as _aes_decrypt_raw,
+    aes_encrypt as _aes_encrypt_raw,
+)
 
 _HUB_PORT = 10000
 _TIMEOUT = 8
 _DIAGNOSTIC_FOLLOWUP_TIMEOUT = 1
 _MAX_RETRIES = 3
 _BACKOFF = 0.5
+_MAX_RECONNECT_BACKOFF = 60
+_HUB_KEEPALIVE_INTERVAL = 30
+
+_LOGGER = logging.getLogger(__name__)
 
 _DIAGNOSTIC_REDACT_KEYS = {
     "accesstoken",
@@ -58,18 +66,6 @@ _DIAGNOSTIC_REDACT_TERMS = (
     "token",
 )
 _REDACTED = "**REDACTED**"
-_DIAGNOSTIC_PROBE_ATTRIBUTES = (
-    "chargeState",
-    "meshNetRssi",
-    "DetectionMode",
-    "energySavingEnable",
-    "energySavingFactor",
-    "lightDuration",
-    "SecurityAlarm",
-    "alarmStatus",
-    "EffectMode",
-)
-_MAX_MISSED_TELEMETRY_POLLS = 3
 
 
 def _make_aes_key(key_str: str) -> bytes:
@@ -87,17 +83,25 @@ def _aes_decrypt(data: bytes, key: bytes) -> str:
     return _aes_decrypt_raw(data, key)  # library returns str
 
 
-def _frame(msg: bytes, key: bytes) -> bytes:
+def _frame(msg: bytes, key: bytes, message_type: int = 1) -> bytes:
     enc = _aes_encrypt(msg, key)
-    return struct.pack(">Hhi", 0x1EED, 1, len(enc)) + enc
+    return struct.pack(">Hhi", 0x1EED, message_type, len(enc)) + enc
 
 
 async def _recv(
-    reader: asyncio.StreamReader, key: bytes, timeout: float = _TIMEOUT
+    reader: asyncio.StreamReader,
+    key: bytes,
+    timeout: float | None = _TIMEOUT,
 ) -> dict:
-    hdr = await asyncio.wait_for(reader.readexactly(8), timeout=timeout)
+    if timeout is None:
+        hdr = await reader.readexactly(8)
+    else:
+        hdr = await asyncio.wait_for(reader.readexactly(8), timeout=timeout)
     _, _, size = struct.unpack(">HHI", hdr)
-    body = await asyncio.wait_for(reader.readexactly(size), timeout=timeout)
+    if timeout is None:
+        body = await reader.readexactly(size)
+    else:
+        body = await asyncio.wait_for(reader.readexactly(size), timeout=timeout)
     raw = _aes_decrypt_raw(body, key)
     return json.loads(raw)
 
@@ -267,14 +271,7 @@ def _next_seq() -> str:
 
 
 class _HubSession:
-    """One persistent, serialised connection to an AiDot hub.
-
-    All BLE devices behind the same hub share a single session, so a per-hub
-    lock serialises commands (the hub resets the socket on concurrent logins)
-    and one logged-in connection is reused across commands (removing the
-    per-command connect+login latency). Transient drops are retried; the retry
-    path also recovers a connection the hub closed while idle.
-    """
+    """Maintain one passive, multiplexed connection to an AiDot BLE hub."""
 
     def __init__(
         self,
@@ -289,55 +286,155 @@ class _HubSession:
         self._aes_key = aes_key
         self._user_id = user_id
         self._hub_password = hub_password
-        self._lock = asyncio.Lock()
+        self._connection_lock = asyncio.Lock()
+        self._request_lock = asyncio.Lock()
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._pending: dict[str, asyncio.Queue[dict | BaseException]] = {}
+        self._early_responses: dict[str, list[dict[str, Any]]] = {}
+        self._device_listeners: dict[
+            str, Callable[[dict[str, Any]], None]
+        ] = {}
+        self._connection_listeners: dict[str, Callable[[bool], None]] = {}
+        self._closing = False
         self._asc = 1
+        self._received_frames = 0
+        self._unrouted_updates = 0
+        self._last_hub_message: datetime | None = None
+        self._device_update_counts: dict[str, int] = {}
+        self._last_device_update: dict[str, datetime] = {}
+        self._last_device_attributes: dict[str, tuple[str, ...]] = {}
+
+    @property
+    def connected(self) -> bool:
+        """Return whether the passive hub listener is connected."""
+        return (
+            self._writer is not None
+            and not self._writer.is_closing()
+            and self._reader_task is not None
+            and not self._reader_task.done()
+        )
+
+    def register_device(
+        self,
+        dev_id: str,
+        listener: Callable[[dict[str, Any]], None],
+        connection_listener: Callable[[bool], None],
+    ) -> None:
+        """Register a BLE device to receive attributes routed by device ID."""
+        self._device_listeners[dev_id] = listener
+        self._connection_listeners[dev_id] = connection_listener
+        connection_listener(self.connected)
+
+    def unregister_device(self, dev_id: str) -> None:
+        """Stop routing passive hub updates to a removed BLE device."""
+        self._device_listeners.pop(dev_id, None)
+        self._connection_listeners.pop(dev_id, None)
+
+    async def stop_if_unused(self) -> None:
+        """Close a hub session after its final BLE device is removed."""
+        if not self._device_listeners:
+            await self.close()
+
+    async def start(self) -> None:
+        """Start the passive listener without failing integration setup."""
+        self._closing = False
+        if self.connected or (
+            self._reconnect_task is not None and not self._reconnect_task.done()
+        ):
+            return
+        try:
+            await self._ensure_connected()
+        except Exception as error:  # noqa: BLE001 - reconnect in background
+            _LOGGER.debug(
+                "BLE hub listener %s unavailable (%s); reconnect scheduled",
+                self._anonymous_hub_id,
+                type(error).__name__,
+            )
+            self._schedule_reconnect()
 
     async def send_command(self, dev_id: str, attr: dict) -> None:
-        """Serialise, (re)connect as needed, and send one setDevAttr command."""
-        async with self._lock:
-            for attempt in range(_MAX_RETRIES):
-                try:
-                    await self._ensure_connected()
-                    await self._send_set_attr(dev_id, attr)
-                    return
-                except (
-                    ConnectionError,
-                    asyncio.TimeoutError,
-                    asyncio.IncompleteReadError,
-                ):
-                    await self._close()
-                    if attempt == _MAX_RETRIES - 1:
-                        raise
-                    await asyncio.sleep(_BACKOFF * (attempt + 1))
+        """Send one command while the session reader owns all socket reads."""
+        await self._request("setDevAttrReq", dev_id, attr)
 
     async def get_attributes(self, dev_id: str, attr: list[str]) -> list[dict]:
-        """Read BLE attributes once, returning all immediate hub responses."""
-        async with self._lock:
+        """Perform an explicit one-shot read through the passive dispatcher."""
+        return await self._request(
+            "getDevAttrReq", dev_id, attr, collect_attribute_response=True
+        )
+
+    async def _request(
+        self,
+        method: str,
+        dev_id: str,
+        attr: dict | list[str],
+        *,
+        collect_attribute_response: bool = False,
+    ) -> list[dict]:
+        """Write a request and await only responses routed to its sequence."""
+        async with self._request_lock:
             for attempt in range(_MAX_RETRIES):
+                seq: str | None = None
                 try:
                     await self._ensure_connected()
-                    return await self._send_get_attr(dev_id, attr)
+                    seq, command = self._make_attr_request(method, dev_id, attr)
+                    response_queue: asyncio.Queue[dict | BaseException] = (
+                        asyncio.Queue()
+                    )
+                    self._pending[seq] = response_queue
+                    for early_response in self._early_responses.pop(seq, []):
+                        response_queue.put_nowait(early_response)
+                    if self._writer is None:
+                        raise ConnectionError("BLE hub writer is unavailable")
+                    self._writer.write(_frame(command, self._aes_key))
+                    await self._writer.drain()
+
+                    responses = [
+                        await self._wait_for_response(response_queue, _TIMEOUT)
+                    ]
+                    if collect_attribute_response and not self._has_attributes(
+                        responses
+                    ):
+                        try:
+                            responses.append(
+                                await self._wait_for_response(
+                                    response_queue,
+                                    _DIAGNOSTIC_FOLLOWUP_TIMEOUT,
+                                )
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                    return responses
                 except (
                     ConnectionError,
                     asyncio.TimeoutError,
                     asyncio.IncompleteReadError,
+                    OSError,
                 ):
-                    await self._close()
+                    await self._drop_connection()
                     if attempt == _MAX_RETRIES - 1:
+                        self._schedule_reconnect()
                         raise
                     await asyncio.sleep(_BACKOFF * (attempt + 1))
                 finally:
-                    # A one-shot diagnostic read may leave delayed notification
-                    # frames behind. Close it so the next control command starts
-                    # with a clean, newly authenticated stream.
-                    await self._close()
+                    if seq is not None:
+                        self._pending.pop(seq, None)
         return []
 
     async def _ensure_connected(self) -> None:
-        if self._writer is None or self._writer.is_closing():
-            await self._connect_and_login()
+        if self.connected:
+            return
+        async with self._connection_lock:
+            if self.connected:
+                return
+            try:
+                await self._connect_and_login()
+            except Exception:
+                await self._drop_connection()
+                raise
 
     async def _connect_and_login(self) -> None:
         self._reader, self._writer = await asyncio.wait_for(
@@ -360,50 +457,33 @@ class _HubSession:
         self._writer.write(_frame(login, self._aes_key))
         await self._writer.drain()
         resp = await _recv(self._reader, self._aes_key)
+        ack = resp.get("ack")
+        if isinstance(ack, dict) and ack.get("code") not in (None, 200):
+            raise ConnectionError(
+                f"BLE hub login failed with code {ack.get('code')}"
+            )
         self._asc = resp.get("payload", {}).get("ascNumber", 1) + 1
-
-    async def _send_set_attr(self, dev_id: str, attr: dict) -> None:
-        cmd = self._make_attr_request("setDevAttrReq", dev_id, attr)
-        self._writer.write(_frame(cmd, self._aes_key))
-        await self._writer.drain()
-        await _recv(self._reader, self._aes_key)
-
-    async def _send_get_attr(self, dev_id: str, attr: list[str]) -> list[dict]:
-        cmd = self._make_attr_request("getDevAttrReq", dev_id, attr)
-        self._writer.write(_frame(cmd, self._aes_key))
-        await self._writer.drain()
-
-        responses = [await _recv(self._reader, self._aes_key)]
-        if not any(
-            isinstance(response.get("payload"), dict)
-            and response["payload"].get("attr")
-            for response in responses
-        ):
-            try:
-                responses.append(
-                    await _recv(
-                        self._reader,
-                        self._aes_key,
-                        timeout=_DIAGNOSTIC_FOLLOWUP_TIMEOUT,
-                    )
-                )
-            except (
-                ConnectionError,
-                asyncio.TimeoutError,
-                asyncio.IncompleteReadError,
-            ):
-                pass
-        return responses
+        self._reader_task = asyncio.create_task(
+            self._receive_loop(self._reader),
+            name=f"aidot_ble_hub_receive_{self._anonymous_hub_id}",
+        )
+        self._keepalive_task = asyncio.create_task(
+            self._keepalive_loop(),
+            name=f"aidot_ble_hub_keepalive_{self._anonymous_hub_id}",
+        )
+        self._notify_connection_state(True)
+        _LOGGER.debug("BLE hub listener %s connected", self._anonymous_hub_id)
 
     def _make_attr_request(
         self, method: str, dev_id: str, attr: dict | list[str]
-    ) -> bytes:
+    ) -> tuple[str, bytes]:
+        seq = _next_seq()
         cmd = json.dumps({
             "method": method,
             "service": "device",
             "clientId": "ha-" + self._user_id,
             "srcAddr": "0." + self._user_id,
-            "seq": _next_seq(),
+            "seq": seq,
             "payload": {
                 "devId": dev_id,
                 "parentId": self._hub_id,
@@ -417,17 +497,282 @@ class _HubSession:
             "deviceId": dev_id,
         }).encode()
         self._asc += 1
-        return cmd
+        return seq, cmd
 
-    async def _close(self) -> None:
+    async def _receive_loop(self, reader: asyncio.StreamReader) -> None:
+        """Continuously receive solicited and unsolicited hub frames."""
+        cancelled = False
+        try:
+            while True:
+                response = await _recv(reader, self._aes_key, timeout=None)
+                self._route_response(response)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as error:  # noqa: BLE001 - any read failure reconnects
+            _LOGGER.debug(
+                "BLE hub listener %s disconnected: %s",
+                self._anonymous_hub_id,
+                type(error).__name__,
+            )
+        finally:
+            if not cancelled and not self._closing and self._reader is reader:
+                self._reader_task = None
+                await self._drop_connection(
+                    cancel_reader=False, expected_reader=reader
+                )
+                self._schedule_reconnect()
+
+    def _route_response(self, response: dict[str, Any]) -> None:
+        """Route a frame to its waiting request and target BLE device."""
+        self._received_frames += 1
+        self._last_hub_message = datetime.now(UTC)
+
+        seq = response.get("seq")
+        response_queue = self._pending.get(str(seq)) if seq is not None else None
+        if response_queue is not None:
+            response_queue.put_nowait(response)
+        elif isinstance(seq, str) and seq.startswith("ha93"):
+            self._early_responses.setdefault(seq, []).append(response)
+            while len(self._early_responses) > 20:
+                self._early_responses.pop(next(iter(self._early_responses)))
+
+        payload = response.get("payload")
+        if not isinstance(payload, dict):
+            return
+        attributes = payload.get("attr")
+        if not isinstance(attributes, dict):
+            return
+
+        dev_id = self._response_device_id(response, payload)
+        listener = self._device_listeners.get(dev_id) if dev_id else None
+        if listener is None:
+            self._unrouted_updates += 1
+            return
+
+        now = datetime.now(UTC)
+        self._device_update_counts[dev_id] = (
+            self._device_update_counts.get(dev_id, 0) + 1
+        )
+        self._last_device_update[dev_id] = now
+        self._last_device_attributes[dev_id] = tuple(
+            sorted(str(attribute) for attribute in attributes)
+        )
+        _LOGGER.debug(
+            "BLE hub update device=%s method=%s attributes=%s",
+            hashlib.sha256(dev_id.encode()).hexdigest()[:12],
+            response.get("method", "unknown"),
+            self._last_device_attributes[dev_id],
+        )
+        try:
+            listener(attributes)
+        except Exception:  # noqa: BLE001 - one entity must not stop the receiver
+            _LOGGER.exception(
+                "Error applying BLE hub update for device %s",
+                hashlib.sha256(dev_id.encode()).hexdigest()[:12],
+            )
+
+    @staticmethod
+    def _response_device_id(
+        response: dict[str, Any], payload: dict[str, Any]
+    ) -> str | None:
+        """Extract the target device ID from known AiDot frame layouts."""
+        payload_dev_id = payload.get("devId")
+        if isinstance(payload_dev_id, str) and payload_dev_id:
+            return payload_dev_id
+        src_addr = response.get("srcAddr")
+        if isinstance(src_addr, str) and src_addr.startswith("1."):
+            return src_addr.split(".", 1)[1]
+        device_id = response.get("deviceId")
+        if isinstance(device_id, str) and device_id:
+            return device_id
+        return None
+
+    @staticmethod
+    def _has_attributes(responses: list[dict]) -> bool:
+        return any(
+            isinstance(response.get("payload"), dict)
+            and isinstance(response["payload"].get("attr"), dict)
+            for response in responses
+        )
+
+    @staticmethod
+    async def _wait_for_response(
+        response_queue: asyncio.Queue[dict | BaseException], timeout: float
+    ) -> dict:
+        response = await asyncio.wait_for(response_queue.get(), timeout=timeout)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    async def _keepalive_loop(self) -> None:
+        """Keep the powered hub connection alive without querying BLE lights."""
+        try:
+            while True:
+                await asyncio.sleep(_HUB_KEEPALIVE_INTERVAL)
+                async with self._request_lock:
+                    if not self.connected or self._writer is None:
+                        return
+                    ping = json.dumps({
+                        "service": "test",
+                        "method": "pingreq",
+                        "seq": "123456",
+                        "srcAddr": "123456",
+                        "payload": {},
+                    }).encode()
+                    self._writer.write(_frame(ping, self._aes_key, message_type=2))
+                    await self._writer.drain()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - reconnect on any socket error
+            _LOGGER.debug(
+                "BLE hub keepalive %s failed: %s",
+                self._anonymous_hub_id,
+                type(error).__name__,
+            )
+            await self._drop_connection(cancel_keepalive=False)
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if self._closing or not self._device_listeners:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(
+            self._reconnect_loop(),
+            name=f"aidot_ble_hub_reconnect_{self._anonymous_hub_id}",
+        )
+
+    async def _reconnect_loop(self) -> None:
+        delay = _BACKOFF
+        try:
+            while not self._closing and self._device_listeners:
+                try:
+                    await self._ensure_connected()
+                    return
+                except Exception as error:  # noqa: BLE001 - retry in background
+                    _LOGGER.debug(
+                        "BLE hub listener %s reconnect failed: %s",
+                        self._anonymous_hub_id,
+                        type(error).__name__,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, _MAX_RECONNECT_BACKOFF)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if asyncio.current_task() is self._reconnect_task:
+                self._reconnect_task = None
+
+    async def _drop_connection(
+        self,
+        *,
+        cancel_reader: bool = True,
+        cancel_keepalive: bool = True,
+        expected_reader: asyncio.StreamReader | None = None,
+    ) -> None:
+        """Drop socket tasks and wake any request waiting on the connection."""
+        if expected_reader is not None and self._reader is not expected_reader:
+            return
+        was_connected = self._writer is not None
+        current_task = asyncio.current_task()
+        reader_task = self._reader_task
+        keepalive_task = self._keepalive_task
+        self._reader_task = None
+        self._keepalive_task = None
+
+        if (
+            cancel_reader
+            and reader_task is not None
+            and reader_task is not current_task
+        ):
+            reader_task.cancel()
+            try:
+                await reader_task
+            except asyncio.CancelledError:
+                pass
+        if (
+            cancel_keepalive
+            and keepalive_task is not None
+            and keepalive_task is not current_task
+        ):
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+
         writer = self._writer
         self._reader = None
         self._writer = None
         if writer is not None:
             try:
                 writer.close()
+                await writer.wait_closed()
             except Exception:  # noqa: BLE001 - closing is best-effort
                 pass
+
+        error = ConnectionError("BLE hub connection closed")
+        for response_queue in self._pending.values():
+            response_queue.put_nowait(error)
+        self._early_responses.clear()
+        if was_connected:
+            self._notify_connection_state(False)
+
+    def _notify_connection_state(self, connected: bool) -> None:
+        """Notify devices when their shared passive transport changes state."""
+        for dev_id, listener in tuple(self._connection_listeners.items()):
+            try:
+                listener(connected)
+            except Exception:  # noqa: BLE001 - isolate device callbacks
+                _LOGGER.exception(
+                    "Error applying BLE connection state for device %s",
+                    hashlib.sha256(dev_id.encode()).hexdigest()[:12],
+                )
+
+    async def close(self) -> None:
+        """Stop reconnecting and close the passive hub listener."""
+        self._closing = True
+        reconnect_task = self._reconnect_task
+        self._reconnect_task = None
+        if (
+            reconnect_task is not None
+            and reconnect_task is not asyncio.current_task()
+        ):
+            reconnect_task.cancel()
+            try:
+                await reconnect_task
+            except asyncio.CancelledError:
+                pass
+        await self._drop_connection()
+        self._device_listeners.clear()
+        self._connection_listeners.clear()
+
+    def device_diagnostics(self, dev_id: str) -> dict[str, Any]:
+        """Return identifier-free passive listener diagnostics for one device."""
+        last_hub_message = self._last_hub_message
+        last_device_update = self._last_device_update.get(dev_id)
+        return {
+            "mode": "passive_hub_listener",
+            "connected": self.connected,
+            "registered": dev_id in self._device_listeners,
+            "receivedFrameCount": self._received_frames,
+            "unroutedUpdateCount": self._unrouted_updates,
+            "deviceUpdateCount": self._device_update_counts.get(dev_id, 0),
+            "lastHubMessage": (
+                last_hub_message.isoformat() if last_hub_message else None
+            ),
+            "lastDeviceUpdate": (
+                last_device_update.isoformat() if last_device_update else None
+            ),
+            "lastAttributeNames": list(
+                self._last_device_attributes.get(dev_id, ())
+            ),
+        }
+
+    @property
+    def _anonymous_hub_id(self) -> str:
+        return hashlib.sha256(self._hub_id.encode()).hexdigest()[:12]
 
 
 _HUB_SESSIONS: dict[str, _HubSession] = {}
@@ -444,15 +789,22 @@ def _get_hub_session(
     return session
 
 
+async def start_all_hub_sessions() -> None:
+    """Start one passive listener for every registered BLE hub."""
+    await asyncio.gather(
+        *(session.start() for session in list(_HUB_SESSIONS.values()))
+    )
+
+
 async def close_all_hub_sessions() -> None:
     """Close every open hub connection and clear the registry (on unload)."""
     for session in list(_HUB_SESSIONS.values()):
-        await session._close()
+        await session.close()
     _HUB_SESSIONS.clear()
 
 
 class BleGatewayDeviceClient:
-    """Controls a BLE mesh light by proxying commands through the AiDot hub's TCP port."""
+    """Control a BLE mesh light through the AiDot hub's TCP connection."""
 
     def __init__(self, device: dict, hub_device: dict, user_id: str) -> None:
         self._device_id: str = device["id"]
@@ -460,8 +812,6 @@ class BleGatewayDeviceClient:
         self._hub_ip: str = hub_device.get("properties", {}).get("ipAddress", "")
         self._hub_password: str = hub_device.get("password", "")
         self._user_id: str = user_id
-        self._missed_telemetry_polls = 0
-        self._telemetry_extra_index = 0
         self._diagnostic_id = hashlib.sha256(self._device_id.encode()).hexdigest()[:12]
         self._aes_key: bytes = _make_aes_key(
             (hub_device.get("aesKey") or [None])[0] or ""
@@ -554,28 +904,23 @@ class BleGatewayDeviceClient:
             effect_mode=_parse_int(props.get("EffectMode"), 0, 65535),
         )
         self.on_status_update: Any = None
+        self._hub_session = _get_hub_session(
+            self._hub_id,
+            self._hub_ip,
+            self._aes_key,
+            self._user_id,
+            self._hub_password,
+        )
+        self._hub_session.register_device(
+            self._device_id,
+            self._handle_hub_update,
+            self._handle_hub_connection,
+        )
 
     def update_cloud_properties(self, device: dict[str, Any]) -> None:
-        """Update cached telemetry from a refreshed AiDot cloud device record."""
+        """Apply cloud state as a low-frequency fallback without active polling."""
         props = device.get("properties", {})
-        self.status.battery = _parse_int(props.get("Battery_remaining"), 0, 100)
-        self.status.mesh_rssi = _parse_int(props.get("meshNetRssi"), -127, 20)
-        self.status.charging = _parse_bool(props.get("chargeState"))
-        self.status.energy_saving_enabled = _parse_bool(
-            props.get("energySavingEnable")
-        )
-        self.status.energy_saving_factor = _parse_percentage_factor(
-            props.get("energySavingFactor")
-        )
-        self.status.light_duration = _parse_int(
-            props.get("lightDuration"), 0, 86400
-        )
-        self.status.detection_mode = _parse_int(
-            props.get("DetectionMode"), 0, 65535
-        )
-        self.status.security_alarm = _parse_alarm(props.get("SecurityAlarm"))
-        self.status.alarm_status = _parse_alarm(props.get("alarmStatus"))
-        self.status.effect_mode = _parse_int(props.get("EffectMode"), 0, 65535)
+        self._apply_attributes(props, record_freshness=False)
         self._diagnostic_attributes = _diagnostic_attributes(device)
         self._diagnostic_cloud_data["properties"] = _redact_diagnostics(
             props, self._diagnostic_secrets
@@ -624,130 +969,86 @@ class BleGatewayDeviceClient:
             received = True
         return received
 
-    async def async_refresh_telemetry(self) -> None:
-        """Refresh battery without treating a sleeping mesh light as offline."""
-        extra_attributes = [
-            attr
-            for attr in _DIAGNOSTIC_PROBE_ATTRIBUTES
-            if attr in self._diagnostic_attributes
-        ]
-        targets = ["Battery_remaining"]
-        if extra_attributes:
-            targets.append(
-                extra_attributes[
-                    self._telemetry_extra_index % len(extra_attributes)
-                ]
-            )
-            self._telemetry_extra_index += 1
+    def _apply_attributes(
+        self,
+        attributes: dict[str, Any],
+        *,
+        record_freshness: bool,
+    ) -> bool:
+        """Apply control and telemetry attributes from one routed update."""
+        received = self._apply_telemetry_attributes(attributes)
 
-        received = False
-        for attribute in dict.fromkeys(targets):
-            session = _get_hub_session(
-                self._hub_id,
-                self._hub_ip,
-                self._aes_key,
-                self._user_id,
-                self._hub_password,
-            )
+        if "OnOff" in attributes:
+            value = _parse_bool(attributes["OnOff"])
+            if value is not None:
+                self.status.on = value
+                received = True
+        if "Dimming" in attributes:
+            value = _parse_int(attributes["Dimming"], 0, 100)
+            if value is not None:
+                self.status.dimming = int(value * 255 / 100)
+                received = True
+        if "CCT" in attributes:
+            value = _parse_int(attributes["CCT"], 0, 100000)
+            if value is not None:
+                self.status.cct = value
+                received = True
+        if "RGBW" in attributes:
             try:
-                responses = await session.get_attributes(
-                    self._device_id, [attribute]
-                )
-            except Exception:  # noqa: BLE001 - a sleeping mesh light is expected
-                responses = []
+                raw_rgbw = int(attributes["RGBW"])
+            except (TypeError, ValueError):
+                pass
+            else:
+                if -(2**31) <= raw_rgbw <= (2**32 - 1):
+                    packed = ctypes.c_uint32(raw_rgbw).value
+                    self.status.rgbw = (
+                        (packed >> 24) & 0xFF,
+                        (packed >> 16) & 0xFF,
+                        (packed >> 8) & 0xFF,
+                        packed & 0xFF,
+                    )
+                    received = True
 
-            for response in responses:
-                payload = response.get("payload")
-                if not isinstance(payload, dict) or not isinstance(
-                    payload.get("attr"), dict
-                ):
-                    continue
-                received |= self._apply_telemetry_attributes(payload["attr"])
-
-        if received:
-            self._missed_telemetry_polls = 0
+        if received and record_freshness:
+            self.status.online = True
             self.status.telemetry_connected = True
             self.status.last_telemetry_update = datetime.now(UTC)
-        else:
-            self._missed_telemetry_polls += 1
-            if self._missed_telemetry_polls >= _MAX_MISSED_TELEMETRY_POLLS:
-                self.status.telemetry_connected = False
+        return received
 
+    def _handle_hub_update(self, attributes: dict[str, Any]) -> None:
+        """Apply an unsolicited update routed by the shared hub listener."""
+        if not self._apply_attributes(attributes, record_freshness=True):
+            return
         if self.on_status_update:
             self.on_status_update(self.status)
 
+    def _handle_hub_connection(self, connected: bool) -> None:
+        """Expose whether the passive path to the powered hub is available."""
+        self.status.telemetry_connected = connected
+        if self.on_status_update:
+            self.on_status_update(self.status)
+
+    async def async_stop(self) -> None:
+        """Unregister this device from the shared passive hub listener."""
+        self._hub_session.unregister_device(self._device_id)
+        await self._hub_session.stop_if_unused()
+
     async def async_get_diagnostics(self) -> dict[str, Any]:
-        """Return redacted cloud metadata and targeted BLE attribute probes."""
-        diagnostics: dict[str, Any] = {
+        """Return redacted cloud data and passive listener health."""
+        return {
             "transport": "ble_mesh_gateway",
             "anonymousDeviceId": self._diagnostic_id,
             "cloud": self._diagnostic_cloud_data,
             "requestedAttributes": self._diagnostic_attributes,
+            "listener": self._hub_session.device_diagnostics(self._device_id),
+            "probe": {
+                "status": "disabled_passive_mode",
+                "reason": "Avoid waking battery-powered BLE devices",
+            },
         }
-        if not self._diagnostic_attributes:
-            diagnostics["probe"] = {"status": "skipped_no_attributes"}
-            return diagnostics
-        if not self._hub_ip:
-            diagnostics["probe"] = {"status": "skipped_no_hub_ip"}
-            return diagnostics
-
-        extra_attributes = [
-            attr
-            for attr in _DIAGNOSTIC_PROBE_ATTRIBUTES
-            if attr in self._diagnostic_attributes
-        ]
-        targets = ["Battery_remaining"]
-        if extra_attributes:
-            target_index = int(self._diagnostic_id, 16) % len(extra_attributes)
-            targets.append(extra_attributes[target_index])
-
-        target_results: list[dict[str, Any]] = []
-        for attribute in dict.fromkeys(targets):
-            session = _get_hub_session(
-                self._hub_id,
-                self._hub_ip,
-                self._aes_key,
-                self._user_id,
-                self._hub_password,
-            )
-            try:
-                responses = await session.get_attributes(
-                    self._device_id, [attribute]
-                )
-            # Diagnostics must remain downloadable when a light or hub is offline.
-            except Exception as error:  # noqa: BLE001
-                target_results.append(
-                    {
-                        "attribute": attribute,
-                        "status": "error",
-                        "errorType": type(error).__name__,
-                    }
-                )
-            else:
-                target_results.append(
-                    {
-                        "attribute": attribute,
-                        "status": "success",
-                        "responses": _redact_diagnostics(
-                            responses, self._diagnostic_secrets
-                        ),
-                    }
-                )
-        diagnostics["probe"] = {
-            "status": "success",
-            "targets": target_results,
-        }
-        return diagnostics
 
     async def _send(self, attr: dict) -> None:
-        session = _get_hub_session(
-            self._hub_id,
-            self._hub_ip,
-            self._aes_key,
-            self._user_id,
-            self._hub_password,
-        )
-        await session.send_command(self._device_id, attr)
+        await self._hub_session.send_command(self._device_id, attr)
 
         if "OnOff" in attr:
             self.status.on = bool(attr["OnOff"])

@@ -8,6 +8,7 @@ real (round-tripped through the installed ``aidot`` library).
 
 import asyncio
 import json
+import struct
 
 import pytest
 
@@ -61,16 +62,18 @@ class FakeWriter:
 
 
 class FakeReader:
-    """Serves pre-framed bytes; raises ``exc`` once the buffer is exhausted."""
+    """Serve framed bytes, then remain open unless an error was requested."""
 
     def __init__(self, frames: list[bytes], exc: Exception | None = None) -> None:
         self._buf = b"".join(frames)
         self._pos = 0
-        self._exc = exc or ConnectionResetError(104, "reset")
+        self._exc = exc
 
     async def readexactly(self, n: int) -> bytes:
         if len(self._buf) - self._pos < n:
-            raise self._exc
+            if self._exc is not None:
+                raise self._exc
+            await asyncio.Future()
         chunk = self._buf[self._pos : self._pos + n]
         self._pos += n
         return chunk
@@ -109,12 +112,25 @@ def _login_frame(asc: int = 5) -> bytes:
     return _frame_obj({"payload": {"ascNumber": asc}})
 
 
-def _ack_frame() -> bytes:
-    return _frame_obj({"payload": {}})
+def _ack_frame(seq: str = "ha9300001") -> bytes:
+    return _frame_obj({"seq": seq, "payload": {}})
 
 
-def _attr_frame(attr: dict) -> bytes:
-    return _frame_obj({"payload": {"attr": attr}})
+def _attr_frame(
+    attr: dict,
+    *,
+    dev_id: str = "devA",
+    method: str = "devAttrNotify",
+    seq: str | None = None,
+) -> bytes:
+    response = {
+        "method": method,
+        "deviceId": dev_id,
+        "payload": {"devId": dev_id, "attr": attr},
+    }
+    if seq is not None:
+        response["seq"] = seq
+    return _frame_obj(response)
 
 
 def _session() -> "bgc._HubSession":
@@ -142,10 +158,11 @@ def _count_logins(writer: FakeWriter) -> int:
 
 
 @pytest.fixture(autouse=True)
-def _clear_registry():
+async def _clear_registry():
     bgc._HUB_SESSIONS.clear()
+    bgc._seq = 0
     yield
-    bgc._HUB_SESSIONS.clear()
+    await bgc.close_all_hub_sessions()
 
 
 # --- tests -----------------------------------------------------------------
@@ -156,7 +173,14 @@ async def test_concurrent_commands_serialise(monkeypatch):
     tracker = _Tracker()
     # One connection, reused; enough acks for both commands.
     server = FakeServer(
-        [{"frames": [_login_frame(), _ack_frame(), _ack_frame()], "tracker": tracker}]
+        [{
+            "frames": [
+                _login_frame(),
+                _ack_frame("ha9300001"),
+                _ack_frame("ha9300002"),
+            ],
+            "tracker": tracker,
+        }]
     )
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
 
@@ -172,7 +196,13 @@ async def test_concurrent_commands_serialise(monkeypatch):
 async def test_connection_is_reused_login_once(monkeypatch):
     """Sequential commands reuse the socket and log in exactly once."""
     server = FakeServer(
-        [{"frames": [_login_frame(), _ack_frame(), _ack_frame()]}]
+        [{
+            "frames": [
+                _login_frame(),
+                _ack_frame("ha9300001"),
+                _ack_frame("ha9300002"),
+            ]
+        }]
     )
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
 
@@ -187,7 +217,13 @@ async def test_connection_is_reused_login_once(monkeypatch):
 async def test_ascnumber_increments_per_command(monkeypatch):
     """Reused connection bumps ascNumber per command (login asc was 5)."""
     server = FakeServer(
-        [{"frames": [_login_frame(asc=5), _ack_frame(), _ack_frame()]}]
+        [{
+            "frames": [
+                _login_frame(asc=5),
+                _ack_frame("ha9300001"),
+                _ack_frame("ha9300002"),
+            ]
+        }]
     )
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
 
@@ -204,9 +240,16 @@ async def test_ascnumber_increments_per_command(monkeypatch):
 
 
 async def test_get_attributes_uses_ble_channel_and_returns_telemetry(monkeypatch):
-    """A diagnostic read sends getDevAttrReq and returns the attribute payload."""
+    """An explicit read is correlated while the passive connection stays open."""
     server = FakeServer(
-        [{"frames": [_login_frame(), _attr_frame({"Battery": 87, "RSSI": -61})]}]
+        [{
+            "frames": [
+                _login_frame(),
+                _attr_frame(
+                    {"Battery": 87, "RSSI": -61}, seq="ha9300001"
+                ),
+            ]
+        }]
     )
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
 
@@ -221,7 +264,7 @@ async def test_get_attributes_uses_ble_channel_and_returns_telemetry(monkeypatch
     assert request["payload"]["channel"] == "ble"
     assert request["payload"]["attr"] == ["Battery", "RSSI"]
     assert responses[0]["payload"]["attr"] == {"Battery": 87, "RSSI": -61}
-    assert server.writers[0].is_closing()
+    assert not server.writers[0].is_closing()
 
 
 async def test_get_attributes_collects_ack_and_followup_telemetry(monkeypatch):
@@ -231,8 +274,8 @@ async def test_get_attributes_collects_ack_and_followup_telemetry(monkeypatch):
             {
                 "frames": [
                     _login_frame(),
-                    _ack_frame(),
-                    _attr_frame({"Battery": 54}),
+                    _ack_frame("ha9300001"),
+                    _attr_frame({"Battery": 54}, seq="ha9300001"),
                 ]
             }
         ]
@@ -245,13 +288,36 @@ async def test_get_attributes_collects_ack_and_followup_telemetry(monkeypatch):
     assert responses[1]["payload"]["attr"]["Battery"] == 54
 
 
+async def test_unsolicited_update_does_not_complete_another_device_request(
+    monkeypatch,
+):
+    """An interleaved push is routed without stealing a command response."""
+    server = FakeServer([
+        {
+            "frames": [
+                _login_frame(),
+                _attr_frame({"OnOff": 1}, dev_id="devB"),
+                _ack_frame("ha9300001"),
+            ]
+        }
+    ])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    client_a = _make_client("devA", "Spot A")
+    client_b = _make_client("devB", "Spot B")
+    await client_a.async_turn_on()
+
+    assert client_a.status.on is True
+    assert client_b.status.on is True
+
+
 async def test_retry_reconnects_after_reset(monkeypatch):
     """A transient reset on the first attempt triggers reconnect + relogin."""
     monkeypatch.setattr(bgc, "_BACKOFF", 0)
     server = FakeServer(
         [
             {"frames": [_login_frame()], "exc": ConnectionResetError(104, "reset")},
-            {"frames": [_login_frame(), _ack_frame()]},
+            {"frames": [_login_frame(), _ack_frame("ha9300002")]},
         ]
     )
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
@@ -271,7 +337,7 @@ async def test_retry_gives_up_after_max_attempts(monkeypatch):
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
 
     sess = _session()
-    with pytest.raises(ConnectionResetError):
+    with pytest.raises(ConnectionError):
         await sess.send_command("devA", {"OnOff": 1})
 
     assert server.connect_count == bgc._MAX_RETRIES
@@ -292,14 +358,85 @@ async def test_close_all_hub_sessions_clears_registry(monkeypatch):
     assert server.writers[0].is_closing()
 
 
+async def test_passive_listener_reconnects_and_resumes_routing(monkeypatch):
+    """A dropped hub socket reconnects without polling any BLE device."""
+    monkeypatch.setattr(bgc, "_BACKOFF", 0)
+    server = FakeServer([
+        {
+            "frames": [_login_frame(), _attr_frame({"OnOff": 1})],
+            "exc": ConnectionResetError(104, "reset"),
+        },
+        {"frames": [_login_frame(), _attr_frame({"OnOff": 0})]},
+    ])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    client = _make_client()
+    await bgc.start_all_hub_sessions()
+    for _ in range(20):
+        diagnostics = client._hub_session.device_diagnostics("devA")
+        if diagnostics["deviceUpdateCount"] == 2:
+            break
+        await asyncio.sleep(0)
+
+    assert server.connect_count == 2
+    assert diagnostics["deviceUpdateCount"] == 2
+    assert client.status.on is False
+    assert all(
+        json.loads(bgc._aes_decrypt(data[8:], KEY))["method"] == "loginReq"
+        for writer in server.writers
+        for data in writer.writes
+    )
+
+
+async def test_keepalive_targets_only_the_powered_hub(monkeypatch):
+    """The listener keepalive contains no BLE device query or identifier."""
+    monkeypatch.setattr(bgc, "_HUB_KEEPALIVE_INTERVAL", 0.001)
+    server = FakeServer([{"frames": [_login_frame()]}])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    _make_client()
+    await bgc.start_all_hub_sessions()
+    await asyncio.sleep(0.005)
+
+    framed_messages = [
+        (
+            struct.unpack(">HhI", data[:8])[1],
+            json.loads(bgc._aes_decrypt(data[8:], KEY)),
+        )
+        for data in server.writers[0].writes
+    ]
+    pings = [message for message_type, message in framed_messages if message_type == 2]
+    assert pings
+    assert all(ping["method"] == "pingreq" for ping in pings)
+    assert all(ping["service"] == "test" for ping in pings)
+    assert all(ping["payload"] == {} for ping in pings)
+    assert all("deviceId" not in ping for ping in pings)
+    assert all(
+        message["method"] != "getDevAttrReq"
+        for _, message in framed_messages
+    )
+
+
+def test_response_device_id_prefers_light_source_over_hub_device_id() -> None:
+    """A source address can route a notification whose deviceId is the hub."""
+    assert (
+        bgc._HubSession._response_device_id(
+            {"srcAddr": "1.devA", "deviceId": "hub1"}, {}
+        )
+        == "devA"
+    )
+
+
 # --- behaviour preserved through the client (regression guard) -------------
 
 
-def _make_client() -> "bgc.BleGatewayDeviceClient":
+def _make_client(
+    dev_id: str = "devA", name: str = "Spot 1"
+) -> "bgc.BleGatewayDeviceClient":
     device = {
-        "id": "devA",
+        "id": dev_id,
         "mac": "AA:BB",
-        "name": "Spot 1",
+        "name": name,
         "product": {"serviceModules": []},
         "properties": {},
     }
@@ -360,33 +497,8 @@ def _make_diagnostic_client() -> "bgc.BleGatewayDeviceClient":
     return bgc.BleGatewayDeviceClient(device, hub, "secret-user-id")
 
 
-async def test_diagnostics_are_redacted_and_probe_advertised_attributes(monkeypatch):
-    """Diagnostics retain telemetry while removing credentials and identifiers."""
-    sensitive_response = {
-        "password": "response-secret",
-        "AESKey": "response-aes-secret",
-        "houseId": "response-house-id",
-        "echo": "secret-password",
-        "echoName": "Back Garden",
-    }
-    server = FakeServer(
-        [
-            {
-                "frames": [
-                    _login_frame(),
-                    _attr_frame({"Battery_remaining": 87, **sensitive_response}),
-                ]
-            },
-            {
-                "frames": [
-                    _login_frame(),
-                    _attr_frame({"chargeState": 1, **sensitive_response}),
-                ]
-            },
-        ]
-    )
-    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
-
+async def test_diagnostics_are_redacted_without_active_probe():
+    """Diagnostics expose listener health without waking a BLE light."""
     diagnostics = await _make_diagnostic_client().async_get_diagnostics()
     encoded = json.dumps(diagnostics)
 
@@ -402,20 +514,10 @@ async def test_diagnostics_are_redacted_and_probe_advertised_attributes(monkeypa
     assert diagnostics["cloud"]["serviceModules"][0]["identity"] == "sensor.battery"
     assert diagnostics["cloud"]["serviceModules"][0]["name"] == "1"
     assert diagnostics["cloud"]["properties"]["ipAddress"] == bgc._REDACTED
-    assert diagnostics["probe"]["status"] == "success"
-    assert len(diagnostics["probe"]["targets"]) == 2
-    battery_target = next(
-        target
-        for target in diagnostics["probe"]["targets"]
-        if target["attribute"] == "Battery_remaining"
-    )
-    response_attr = battery_target["responses"][0]["payload"]["attr"]
-    assert response_attr["Battery_remaining"] == 87
-    assert response_attr["password"] == bgc._REDACTED
-    assert response_attr["AESKey"] == bgc._REDACTED
-    assert response_attr["houseId"] == bgc._REDACTED
-    assert response_attr["echo"] == bgc._REDACTED
-    assert response_attr["echoName"] == bgc._REDACTED
+    assert diagnostics["probe"]["status"] == "disabled_passive_mode"
+    assert diagnostics["listener"]["mode"] == "passive_hub_listener"
+    assert diagnostics["listener"]["registered"] is True
+    assert diagnostics["listener"]["deviceUpdateCount"] == 0
     for secret in (
         "secret-device-id",
         "AA:BB:CC:DD:EE:FF",
@@ -426,9 +528,6 @@ async def test_diagnostics_are_redacted_and_probe_advertised_attributes(monkeypa
         "secret-password",
         "testkey",
         "secret-user-id",
-        "response-secret",
-        "response-aes-secret",
-        "response-house-id",
     ):
         assert secret not in encoded
 
@@ -495,6 +594,10 @@ def test_cloud_telemetry_initializes_and_refreshes() -> None:
                 "Battery_remaining": "54",
                 "meshNetRssi": "-67",
                 "chargeState": "0",
+                "OnOff": "1",
+                "Dimming": "20",
+                "CCT": "3000",
+                "RGBW": str(0x10203040),
             },
         }
     )
@@ -502,42 +605,105 @@ def test_cloud_telemetry_initializes_and_refreshes() -> None:
     assert client.status.battery == 54
     assert client.status.mesh_rssi == -67
     assert client.status.charging is False
+    assert client.status.on is True
+    assert client.status.dimming == 51
+    assert client.status.cct == 3000
+    assert client.status.rgbw == (0x10, 0x20, 0x30, 0x40)
+    assert client.status.energy_saving_enabled is True
+    assert client.status.energy_saving_factor == 80
     assert seen and seen[-1] is client.status
 
 
-async def test_live_battery_refresh_updates_freshness(monkeypatch) -> None:
-    """A live battery response replaces cloud data and records freshness."""
-    server = FakeServer(
-        [{"frames": [_login_frame(), _attr_frame({"Battery_remaining": 34})]}]
-    )
+async def test_passive_update_refreshes_light_and_telemetry(monkeypatch) -> None:
+    """An unsolicited hub frame updates state without querying the BLE light."""
+    server = FakeServer([
+        {
+            "frames": [
+                _login_frame(),
+                _attr_frame(
+                    {
+                        "OnOff": 1,
+                        "Dimming": 40,
+                        "CCT": 3200,
+                        "RGBW": 0x11223344,
+                        "Battery_remaining": 34,
+                    },
+                    dev_id="secret-device-id",
+                ),
+            ]
+        }
+    ])
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
 
     client = _make_diagnostic_client()
-    await client.async_refresh_telemetry()
+    seen: list[bool] = []
+    client.on_status_update = lambda status: seen.append(status.on)
+    await bgc.start_all_hub_sessions()
+    await asyncio.sleep(0)
 
+    assert client.status.on is True
+    assert client.status.dimming == 102
+    assert client.status.cct == 3200
+    assert client.status.rgbw == (0x11, 0x22, 0x33, 0x44)
     assert client.status.battery == 34
     assert client.status.telemetry_connected is True
     assert client.status.last_telemetry_update is not None
+    assert seen == [False, True]
+
+    messages = [
+        json.loads(bgc._aes_decrypt(data[8:], KEY))
+        for data in server.writers[0].writes
+    ]
+    assert [message["method"] for message in messages] == ["loginReq"]
 
 
-async def test_three_missed_live_polls_mark_telemetry_disconnected(monkeypatch) -> None:
-    """Sleeping lights keep their battery value but eventually report no telemetry."""
-    server = FakeServer(
-        [
-            {"frames": [_login_frame(), _ack_frame()]},
-            {"frames": [_login_frame(), _ack_frame()]},
-            {"frames": [_login_frame(), _ack_frame()]},
-        ]
-    )
+async def test_passive_updates_are_routed_to_the_correct_device(monkeypatch) -> None:
+    """One shared hub reader must never apply one light's update to another."""
+    server = FakeServer([
+        {
+            "frames": [
+                _login_frame(),
+                _attr_frame({"OnOff": 1}, dev_id="devA"),
+                _attr_frame(
+                    {"OnOff": 0, "Battery_remaining": 72}, dev_id="devB"
+                ),
+            ]
+        }
+    ])
     monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
 
-    client = _make_diagnostic_client()
-    original_battery = client.status.battery
-    for _ in range(bgc._MAX_MISSED_TELEMETRY_POLLS):
-        await client.async_refresh_telemetry()
+    client_a = _make_client("devA", "Spot A")
+    client_b = _make_client("devB", "Spot B")
+    await bgc.start_all_hub_sessions()
+    await asyncio.sleep(0)
 
-    assert client.status.battery == original_battery
-    assert client.status.telemetry_connected is False
+    assert client_a.status.on is True
+    assert client_a.status.battery is None
+    assert client_b.status.on is False
+    assert client_b.status.battery == 72
+
+
+async def test_passive_autonomous_off_is_forwarded(monkeypatch) -> None:
+    """A fixture's timer-driven off update reaches Home Assistant callbacks."""
+    server = FakeServer([
+        {
+            "frames": [
+                _login_frame(),
+                _attr_frame({"OnOff": 1}, dev_id="devA"),
+                _attr_frame({"OnOff": 0}, dev_id="devA"),
+            ]
+        }
+    ])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+
+    client = _make_client()
+    states: list[bool] = []
+    client.on_status_update = lambda status: states.append(status.on)
+    await bgc.start_all_hub_sessions()
+    await asyncio.sleep(0)
+
+    assert states == [False, True, False]
+    assert client.status.on is False
 
 
 async def test_optimistic_status_updates_after_command(monkeypatch):

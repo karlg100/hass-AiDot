@@ -1,6 +1,6 @@
 """Coordinator for Aidot."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 import logging
 
 from aidot.client import AidotClient
@@ -19,18 +19,20 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .auth import get_login_data
-from .ble_gateway_client import BleGatewayDeviceClient, close_all_hub_sessions
+from .ble_gateway_client import (
+    BleGatewayDeviceClient,
+    close_all_hub_sessions,
+    start_all_hub_sessions,
+)
 from .const import DOMAIN
 
 type AidotConfigEntry = ConfigEntry[AidotDeviceManagerCoordinator]
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_DEVICE_LIST_INTERVAL = timedelta(hours=6)
-BLE_TELEMETRY_POLL_INTERVAL = timedelta(minutes=2)
 
 _HUB_TYPE = "BleMesh_Hub"
 
@@ -91,8 +93,6 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         )
         self.client.set_token_fresh_cb(self.token_fresh_cb)
         self.device_coordinators: dict[str, AidotDeviceUpdateCoordinator] = {}
-        self._telemetry_poll_index = 0
-        self._cancel_telemetry_poll = None
 
     async def _async_setup(self) -> None:
         """Set up the coordinator."""
@@ -100,20 +100,6 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             await self.async_auto_login()
         except AidotUserOrPassIncorrect as error:
             raise ConfigEntryAuthFailed from error
-
-    async def _async_poll_next_ble_device(self, now: datetime) -> None:
-        """Poll one BLE light per interval so the hub is never flooded."""
-        del now
-        coordinators = [
-            coordinator
-            for coordinator in self.device_coordinators.values()
-            if isinstance(coordinator.device_client, BleGatewayDeviceClient)
-        ]
-        if not coordinators:
-            return
-        coordinator = coordinators[self._telemetry_poll_index % len(coordinators)]
-        self._telemetry_poll_index += 1
-        await coordinator.device_client.async_refresh_telemetry()
 
     async def _async_update_data(self) -> None:
         """Update data async."""
@@ -156,6 +142,8 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         for dev_id in removed_ids:
             coordinator = self.device_coordinators.pop(dev_id)
             coordinator.device_client.on_status_update = None
+            if isinstance(coordinator.device_client, BleGatewayDeviceClient):
+                await coordinator.device_client.async_stop()
         if removed_ids:
             self._purge_deleted_lists()
 
@@ -187,20 +175,14 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
                 if isinstance(existing_client, BleGatewayDeviceClient):
                     existing_client.update_cloud_properties(device)
 
-        if self._cancel_telemetry_poll is None:
-            self._cancel_telemetry_poll = async_track_time_interval(
-                self.hass,
-                self._async_poll_next_ble_device,
-                BLE_TELEMETRY_POLL_INTERVAL,
-            )
+        await start_all_hub_sessions()
 
     async def async_cleanup(self) -> None:
         """Perform cleanup actions."""
-        if self._cancel_telemetry_poll is not None:
-            self._cancel_telemetry_poll()
-            self._cancel_telemetry_poll = None
         for coordinator in self.device_coordinators.values():
             coordinator.device_client.on_status_update = None
+            if isinstance(coordinator.device_client, BleGatewayDeviceClient):
+                await coordinator.device_client.async_stop()
         await close_all_hub_sessions()
         await self.client.async_cleanup()
 
