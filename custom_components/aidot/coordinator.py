@@ -3,6 +3,7 @@
 from datetime import UTC, datetime, timedelta
 import logging
 import time
+from typing import override
 
 from aidot.client import AidotClient
 from aidot.const import (
@@ -59,6 +60,7 @@ class AidotDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceStatusData]):
         )
         self.device_client = device_client
 
+    @override
     async def _async_setup(self) -> None:
         """Set up the coordinator."""
         self.device_client.on_status_update = self._handle_status_update
@@ -67,6 +69,7 @@ class AidotDeviceUpdateCoordinator(DataUpdateCoordinator[DeviceStatusData]):
         """Handle status callback."""
         self.async_set_updated_data(status)
 
+    @override
     async def _async_update_data(self) -> DeviceStatusData:
         """Return current status."""
         return self.device_client.status
@@ -103,6 +106,7 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             "lastSuccessfulRefresh": None,
         }
 
+    @override
     async def _async_setup(self) -> None:
         """Set up the coordinator."""
         try:
@@ -114,6 +118,7 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
                 raise ConfigEntryAuthFailed from error
             raise
 
+    @override
     async def _async_update_data(self) -> None:
         """Update data async."""
         try:

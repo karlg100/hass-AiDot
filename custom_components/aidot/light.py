@@ -1,7 +1,7 @@
 """Support for Aidot lights."""
 
 import ctypes
-from typing import Any
+from typing import Any, override
 
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
@@ -64,8 +64,10 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         )
         self._effect_codes = getattr(coordinator.device_client.info, "effects", {})
         self._effect_names = {code: name for name, code in self._effect_codes.items()}
-        if self._effect_codes:
-            self._attr_effect_list = list(self._effect_codes)
+        self._preset_names = getattr(coordinator.device_client.info, "preset_names", [])
+        effects = list(dict.fromkeys([*self._effect_codes, *self._preset_names]))
+        if effects:
+            self._attr_effect_list = effects
             self._attr_supported_features = LightEntityFeature.EFFECT
         if coordinator.device_client.info.enable_rgbw:
             self._attr_color_mode = ColorMode.RGBW
@@ -86,24 +88,27 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         self._attr_rgbw_color = self.coordinator.data.rgbw
         self._attr_effect = self._effect_names.get(
             getattr(self.coordinator.data, "effect_mode", None)
-        )
+        ) or getattr(self.coordinator.data, "effect", None) or None
         active_mode = getattr(self.coordinator.data, "active_color_mode", None)
         if active_mode in self._attr_supported_color_modes:
             self._attr_color_mode = ColorMode(active_mode)
 
     @property
+    @override
     def available(self) -> bool:
         """Return if entity is available."""
         return super().available and self.coordinator.data.online
 
     @callback
+    @override
     def _handle_coordinator_update(self) -> None:
         """Update."""
         self._update_status()
         super()._handle_coordinator_update()
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Apply the complete request in one packet, including on-from-off."""
+        """Batch light attributes, then delegate Wi-Fi presets to the library."""
         attributes: dict[str, int] = {"OnOff": 1}
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             attributes["CCT"] = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
@@ -111,7 +116,10 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
             rgbw = tuple(max(0, min(255, round(c))) for c in kwargs[ATTR_RGBW_COLOR])
             packed = (rgbw[0] << 24) | (rgbw[1] << 16) | (rgbw[2] << 8) | rgbw[3]
             attributes["RGBW"] = ctypes.c_int32(packed).value
-        if ATTR_EFFECT in kwargs:
+        preset = kwargs.get(ATTR_EFFECT)
+        if preset not in self._preset_names:
+            preset = None
+        if ATTR_EFFECT in kwargs and preset is None:
             attributes["EffectMode"] = self._effect_codes[kwargs[ATTR_EFFECT]]
         if ATTR_BRIGHTNESS in kwargs:
             attributes["Dimming"] = int(kwargs[ATTR_BRIGHTNESS] * 100 / 255)
@@ -119,6 +127,10 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         # Both the Wi-Fi library and BLE adapter accept a complete attribute map.
         # Do not send cached colour alongside brightness-only or plain-on calls.
         await self.coordinator.device_client.send_dev_attr(attributes)
+        if preset is not None:
+            # Wi-Fi presets use the upstream cloud primitive API, not a numeric
+            # BLE EffectMode. Keep that path intact when applying brightness.
+            await self.coordinator.device_client.async_set_effect(preset)
         status = self.coordinator.data
         status.on = True
         if "CCT" in attributes:
@@ -129,11 +141,19 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
             status.active_color_mode = ColorMode.RGBW
         if "Dimming" in attributes:
             status.dimming = int(attributes["Dimming"] * 255 / 100)
+        if ATTR_EFFECT not in kwargs and ("CCT" in attributes or "RGBW" in attributes):
+            if hasattr(status, "effect"):
+                status.effect = ""
+            if hasattr(status, "effect_mode"):
+                status.effect_mode = None
         if "EffectMode" in attributes:
             status.effect_mode = attributes["EffectMode"]
+        if preset is not None:
+            status.effect = preset
         self._update_status()
         self.async_write_ha_state()
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
         await self.coordinator.device_client.async_turn_off()
