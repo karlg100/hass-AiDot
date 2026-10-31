@@ -2,6 +2,11 @@
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+from aidot.exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
+import pytest
 
 _AUTH_PATH = (
     Path(__file__).resolve().parent.parent / "custom_components" / "aidot" / "auth.py"
@@ -44,3 +49,60 @@ def test_get_country_code_derives_legacy_value() -> None:
         )
         == "US"
     )
+
+
+async def test_valid_session_does_not_log_in_again() -> None:
+    devices = {"device_list": []}
+    client = SimpleNamespace(
+        async_get_all_device=AsyncMock(return_value=devices),
+        async_post_login=AsyncMock(),
+    )
+    save = Mock()
+    assert await auth.async_get_devices_with_relogin(client, save) is devices
+    client.async_post_login.assert_not_awaited()
+    save.assert_not_called()
+
+
+async def test_invalid_cloud_session_logs_in_once_and_saves_before_retry() -> None:
+    devices = {"device_list": [{"id": "light"}]}
+    saved = False
+
+    def save():
+        nonlocal saved
+        saved = True
+
+    async def fetch():
+        if not saved:
+            raise AidotAuthFailed()
+        return devices
+
+    client = SimpleNamespace(
+        async_get_all_device=AsyncMock(side_effect=fetch),
+        async_post_login=AsyncMock(),
+    )
+    assert await auth.async_get_devices_with_relogin(client, save) is devices
+    client.async_post_login.assert_awaited_once()
+    assert client.async_get_all_device.await_count == 2
+
+
+async def test_bad_password_propagates_to_home_assistant_reauth() -> None:
+    client = SimpleNamespace(
+        async_get_all_device=AsyncMock(side_effect=AidotAuthFailed()),
+        async_post_login=AsyncMock(side_effect=AidotUserOrPassIncorrect()),
+    )
+    save = Mock()
+    with pytest.raises(AidotUserOrPassIncorrect):
+        await auth.async_get_devices_with_relogin(client, save)
+    save.assert_not_called()
+    assert client.async_get_all_device.await_count == 1
+
+
+async def test_repeated_invalid_session_does_not_loop() -> None:
+    client = SimpleNamespace(
+        async_get_all_device=AsyncMock(side_effect=AidotAuthFailed()),
+        async_post_login=AsyncMock(),
+    )
+    with pytest.raises(AidotAuthFailed):
+        await auth.async_get_devices_with_relogin(client, Mock())
+    client.async_post_login.assert_awaited_once()
+    assert client.async_get_all_device.await_count == 2

@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 import logging
+import time
 
 from aidot.client import AidotClient
 from aidot.const import (
@@ -21,7 +22,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .auth import get_login_data
+from .auth import async_get_devices_with_relogin, get_login_data
 from .ble_gateway_client import (
     BleGatewayDeviceClient,
     close_all_hub_sessions,
@@ -33,6 +34,7 @@ type AidotConfigEntry = ConfigEntry[AidotDeviceManagerCoordinator]
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_DEVICE_LIST_INTERVAL = timedelta(hours=6)
+HUB_RECOVERY_REFRESH_INTERVAL = 300
 
 _HUB_TYPE = "BleMesh_Hub"
 
@@ -93,6 +95,7 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         )
         self.client.set_token_fresh_cb(self.token_fresh_cb)
         self.device_coordinators: dict[str, AidotDeviceUpdateCoordinator] = {}
+        self._last_hub_refresh = time.monotonic()
 
     async def _async_setup(self) -> None:
         """Set up the coordinator."""
@@ -104,9 +107,12 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
     async def _async_update_data(self) -> None:
         """Update data async."""
         try:
-            data = await self.client.async_get_all_device()
-        except AidotAuthFailed as error:
+            data = await async_get_devices_with_relogin(
+                self.client, self.token_fresh_cb
+            )
+        except (AidotAuthFailed, AidotUserOrPassIncorrect) as error:
             raise ConfigEntryAuthFailed from error
+        self._last_hub_refresh = time.monotonic()
 
         all_devices: list[dict] = data[CONF_DEVICE_LIST]
 
@@ -157,6 +163,9 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
                     device_client: DeviceClient | BleGatewayDeviceClient = (
                         BleGatewayDeviceClient(device, hub_device, user_id)
                     )
+                    await device_client.async_update_hub(
+                        hub_device, user_id, self._schedule_hub_refresh
+                    )
                     _LOGGER.debug(
                         "Using BLE gateway client for %s via hub %s",
                         device.get("name"),
@@ -173,9 +182,22 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             elif dev_id in ble_devices:
                 existing_client = self.device_coordinators[dev_id].device_client
                 if isinstance(existing_client, BleGatewayDeviceClient):
+                    await existing_client.async_update_hub(
+                        hub_devices[device["directGateway"]],
+                        user_id,
+                        self._schedule_hub_refresh,
+                    )
                     existing_client.update_cloud_properties(device)
 
         await start_all_hub_sessions()
+
+    def _schedule_hub_refresh(self) -> None:
+        """Refresh expired hub connection data without hammering the cloud."""
+        now = time.monotonic()
+        if now - self._last_hub_refresh < HUB_RECOVERY_REFRESH_INTERVAL:
+            return
+        self._last_hub_refresh = now
+        self.hass.async_create_task(self.async_request_refresh())
 
     async def async_cleanup(self) -> None:
         """Perform cleanup actions."""
@@ -189,13 +211,18 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
     def token_fresh_cb(self) -> None:
         """Update token."""
         self.hass.config_entries.async_update_entry(
-            self.config_entry, data=self.client.login_info.copy()
+            self.config_entry,
+            data={
+                **get_login_data(self.config_entry.data),
+                **self.client.login_info,
+            },
         )
 
     async def async_auto_login(self) -> None:
         """Async auto login."""
         if self.client.login_info.get(CONF_ACCESS_TOKEN) is None:
             await self.client.async_post_login()
+            self.token_fresh_cb()
 
     def _purge_deleted_lists(self) -> None:
         """Purge device entries of deleted lists."""

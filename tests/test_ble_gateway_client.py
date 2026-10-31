@@ -417,6 +417,111 @@ async def test_keepalive_targets_only_the_powered_hub(monkeypatch):
     )
 
 
+async def test_hub_disconnect_and_recovery_update_all_light_availability(monkeypatch):
+    server = FakeServer([{"frames": [_login_frame()]}])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    clients = [_make_client("devA"), _make_client("devB")]
+    session = clients[0]._hub_session
+    assert all(client.status.online is False for client in clients)
+
+    await session.start()
+    assert all(client.status.online is True for client in clients)
+    await session._drop_connection()
+    assert all(client.status.online is False for client in clients)
+    assert all(client.status.telemetry_connected is False for client in clients)
+
+    await session.start()
+    assert all(client.status.online is True for client in clients)
+    assert all(client.status.last_telemetry_update is None for client in clients)
+
+
+async def test_refreshed_hub_credentials_reconnect_shared_session_in_place(monkeypatch):
+    new_key = bgc._make_aes_key("replacementkey")
+    new_login = bgc._frame(json.dumps({"payload": {"ascNumber": 8}}).encode(), new_key)
+    new_ack = bgc._frame(json.dumps({"seq": "ha9300001", "payload": {}}).encode(), new_key)
+    server = FakeServer([
+        {"frames": [_login_frame()]},
+        {"frames": [new_login, new_ack]},
+    ])
+    hosts = []
+
+    async def connect(host, port):
+        hosts.append(host)
+        return await server.open_connection(host, port)
+
+    monkeypatch.setattr(bgc.asyncio, "open_connection", connect)
+    client_a, client_b = _make_client("devA"), _make_client("devB")
+    session = client_a._hub_session
+    await session.start()
+    updated_hub = {
+        "id": "hub1", "password": "new-password", "aesKey": ["replacementkey"],
+        "properties": {"ipAddress": "10.0.0.9"},
+    }
+    await client_a.async_update_hub(updated_hub, "new-user")
+    await client_b.async_update_hub(updated_hub, "new-user")
+    assert server.writers[0].is_closing()
+    assert client_a._hub_session is client_b._hub_session is session
+    assert all(not client.status.online for client in (client_a, client_b))
+
+    await client_b.async_turn_on()
+    assert hosts == ["10.0.0.5", "10.0.0.9"]
+    login = json.loads(bgc._aes_decrypt(server.writers[1].writes[0][8:], new_key))
+    assert login["payload"]["password"] == "new-password"
+    assert login["payload"]["userId"] == "new-user"
+    assert all(client.status.online for client in (client_a, client_b))
+    assert set(session._device_listeners) == {"devA", "devB"}
+
+    await client_a.async_update_hub(updated_hub, "new-user")
+    assert session.connected
+    assert server.connect_count == 2
+
+
+async def test_reset_during_login_records_phase_and_requests_refresh(monkeypatch):
+    server = FakeServer([{"exc": ConnectionResetError(104, "secret-password")}])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    client = _make_client()
+    refreshes = []
+    client._hub_session._on_login_failure = lambda: refreshes.append(True)
+    with pytest.raises(ConnectionResetError):
+        await client._hub_session._ensure_connected()
+    diagnostics = client._hub_session.device_diagnostics("devA")
+    assert diagnostics["lastConnectionError"]["stage"] == "login_response"
+    assert diagnostics["lastConnectionError"]["errno"] == 104
+    assert diagnostics["connectionAttempts"] == 1
+    assert "secret-password" not in json.dumps(diagnostics)
+    assert refreshes == [True]
+    assert not client.status.online
+
+
+async def test_silent_hub_is_disconnected_and_retried(monkeypatch):
+    monkeypatch.setattr(bgc, "_HUB_IDLE_TIMEOUT", 0.005)
+    monkeypatch.setattr(bgc, "_BACKOFF", 0.05)
+    server = FakeServer([{"frames": [_login_frame()]}])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    client = _make_client()
+    await client._hub_session.start()
+    assert client.status.online
+    await asyncio.sleep(0.015)
+    # The retry may already be connected, but the silent socket must be closed.
+    assert server.writers[0].is_closing()
+    assert client._hub_session.device_diagnostics("devA")["lastConnectionError"]["type"] == "TimeoutError"
+
+
+async def test_gateway_change_unregisters_old_hub_and_keeps_new_listener():
+    client = _make_client()
+    old_session = client._hub_session
+    await client.async_update_hub(
+        {"id": "hub2", "password": "pw", "aesKey": ["testkey"],
+         "properties": {"ipAddress": "10.0.0.8"}},
+        "user1",
+    )
+    assert old_session._closing
+    assert not old_session._device_listeners
+    assert "hub1" not in bgc._HUB_SESSIONS
+    assert client._hub_session is bgc._HUB_SESSIONS["hub2"]
+    assert "devA" in client._hub_session._device_listeners
+
+
 def test_response_device_id_prefers_light_source_over_hub_device_id() -> None:
     """A source address can route a notification whose deviceId is the hub."""
     assert (

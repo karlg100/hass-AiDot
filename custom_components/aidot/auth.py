@@ -1,12 +1,32 @@
 """Helpers for reading AiDot credentials from config entries."""
 
-from collections.abc import Mapping
-from typing import Any
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any
 
 from aidot.const import CONF_COUNTRY, DEFAULT_COUNTRY_CODE, SUPPORTED_COUNTRYS
+from aidot.exceptions import AidotAuthFailed
+
+if TYPE_CHECKING:
+    from aidot.client import AidotClient
 
 _CONF_COUNTRY_CODE = "country_code"
 _LEGACY_LOGIN_INFO_KEYS = ("login_info", "loginInfo")
+
+
+async def async_get_devices_with_relogin(
+    client: AidotClient, on_login: Callable[[], None]
+) -> dict[str, Any]:
+    """Recover one invalid cloud session using the saved account credentials."""
+    try:
+        return await client.async_get_all_device()
+    except AidotAuthFailed:
+        # A session can be invalidated even while the stored password is valid.
+        # Retry only once; invalid credentials still enter HA's reauth flow.
+        await client.async_post_login()
+        on_login()
+        return await client.async_get_all_device()
 
 
 def get_login_data(entry_data: Mapping[str, Any]) -> Mapping[str, Any]:
