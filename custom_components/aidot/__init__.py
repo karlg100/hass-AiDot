@@ -4,6 +4,9 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
 from .coordinator import AidotConfigEntry, AidotDeviceManagerCoordinator
+from .logging_utils import configure_library_logging
+
+configure_library_logging()
 
 PLATFORMS: list[Platform] = [
     Platform.BINARY_SENSOR,

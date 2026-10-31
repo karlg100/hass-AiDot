@@ -522,6 +522,168 @@ async def test_gateway_change_unregisters_old_hub_and_keeps_new_listener():
     assert "devA" in client._hub_session._device_listeners
 
 
+async def test_compound_attributes_use_one_ble_packet(monkeypatch):
+    server = FakeServer([{"frames": [_login_frame(), _ack_frame()]}])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    client = _make_client()
+    await client.send_dev_attr({"OnOff": 1, "RGBW": -16777216, "Dimming": 50})
+    messages = [json.loads(bgc._aes_decrypt(w[8:], KEY)) for w in server.writers[0].writes]
+    commands = [m for m in messages if m["method"] == "setDevAttrReq"]
+    assert len(commands) == 1
+    assert commands[0]["payload"]["attr"] == {"OnOff": 1, "RGBW": -16777216, "Dimming": 50}
+    assert client.status.rgbw == (255, 0, 0, 0)
+    assert client.status.dimming == 127
+    assert client.status.active_color_mode == "rgbw"
+
+
+async def test_rejected_command_does_not_update_state_or_reconnect(monkeypatch):
+    reject = _frame_obj({"seq": "ha9300001", "ack": {"code": 403}, "payload": {}})
+    server = FakeServer([{"frames": [_login_frame(), reject]}])
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    client = _make_client()
+    with pytest.raises(bgc.HubCommandError, match="403"):
+        await client.send_dev_attr({"OnOff": 1, "RGBW": -16777216, "Dimming": 50})
+    assert client.status.on is False
+    assert server.connect_count == 1
+    assert client._hub_session.connected
+
+
+def test_colour_mode_follows_unambiguous_telemetry():
+    client = _make_client()
+    client._handle_hub_update({"CCT": 2700})
+    assert client.status.active_color_mode == "color_temp"
+    client._handle_hub_update({"RGBW": -16777216})
+    assert client.status.active_color_mode == "rgbw"
+    client._handle_hub_update({"CCT": 3000, "RGBW": -16777216})
+    assert client.status.active_color_mode == "rgbw"
+    client._handle_hub_update({"lastNotifyCctRgbw": "CCT"})
+    assert client.status.active_color_mode == "color_temp"
+
+
+class ControlledServer:
+    """Supply acknowledgements only when the test releases them."""
+
+    def __init__(self):
+        self.writers = []
+        self.commands = []
+        self.auto_ack = False
+
+    async def open_connection(self, host, port):
+        server = self
+        reader = asyncio.StreamReader()
+
+        class Writer(FakeWriter):
+            def write(self, data):
+                super().write(data)
+                message = json.loads(bgc._aes_decrypt(data[8:], KEY))
+                if message["method"] == "loginReq":
+                    reader.feed_data(_login_frame())
+                else:
+                    server.commands.append((reader, message))
+                    if server.auto_ack:
+                        server.ack(reader, message)
+
+            def close(self):
+                super().close()
+                reader.feed_eof()
+
+        writer = Writer()
+        self.writers.append(writer)
+        return reader, writer
+
+    def ack(self, reader, message):
+        reader.feed_data(_frame_obj({
+            "seq": message["seq"], "ack": {"code": 200},
+            "payload": {"devId": message["payload"]["devId"]},
+        }))
+
+
+async def wait_for_commands(server, count):
+    for _ in range(200):
+        if len(server.commands) >= count:
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"Expected {count} commands, got {len(server.commands)}")
+
+
+async def test_pipeline_is_bounded_and_correlates_reversed_replies(monkeypatch):
+    server = ControlledServer()
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    session = _session()
+    tasks = [asyncio.create_task(session._request(
+        "setDevAttrReq", f"dev{i}", {"OnOff": 1}
+    )) for i in range(8)]
+    try:
+        await wait_for_commands(server, 4)
+        assert len(server.commands) == 4
+        assert len(session._pending) == 4
+        for reader, message in reversed(server.commands[:4]):
+            server.ack(reader, message)
+        await wait_for_commands(server, 8)
+        for reader, message in reversed(server.commands[4:]):
+            server.ack(reader, message)
+        results = await asyncio.gather(*tasks)
+        assert [r[0]["payload"]["devId"] for r in results] == [f"dev{i}" for i in range(8)]
+        assert len(server.writers) == 1
+        assert session._max_pending_requests == 4
+        assert session._acknowledged_commands == 8
+    finally:
+        await session.close()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_pipeline_preserves_same_light_command_order(monkeypatch):
+    server = ControlledServer()
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    session = _session()
+    tasks = [asyncio.create_task(session.send_command(dev, {"OnOff": on}))
+             for dev, on in [("devA", 1), ("devA", 0), ("devB", 1)]]
+    try:
+        await wait_for_commands(server, 2)
+        assert {m["payload"]["devId"] for _, m in server.commands} == {"devA", "devB"}
+        for reader, message in server.commands[:2]:
+            server.ack(reader, message)
+        await wait_for_commands(server, 3)
+        reader, message = server.commands[2]
+        assert message["payload"]["devId"] == "devA"
+        assert message["payload"]["attr"] == {"OnOff": 0}
+        server.ack(reader, message)
+        await asyncio.gather(*tasks)
+    finally:
+        await session.close()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_pending_commands_share_reconnect_without_closing_new_socket(monkeypatch):
+    monkeypatch.setattr(bgc, "_BACKOFF", 0)
+    server = ControlledServer()
+    monkeypatch.setattr(bgc.asyncio, "open_connection", server.open_connection)
+    session = _session()
+    tasks = [asyncio.create_task(session.send_command(dev, {"OnOff": 1}))
+             for dev in ("devA", "devB")]
+    try:
+        await wait_for_commands(server, 2)
+        old_reader = session._reader
+        server.auto_ack = True
+        await session._drop_connection()
+        await asyncio.gather(*tasks)
+        assert len(server.writers) == 2
+        assert server.writers[0].is_closing()
+        await session._drop_connection(expected_reader=old_reader)
+        assert session.connected
+        assert not server.writers[1].is_closing()
+        assert not session._pending
+    finally:
+        await session.close()
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def test_response_device_id_prefers_light_source_over_hub_device_id() -> None:
     """A source address can route a notification whose deviceId is the hub."""
     assert (

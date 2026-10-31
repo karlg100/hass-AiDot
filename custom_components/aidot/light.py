@@ -1,5 +1,6 @@
 """Support for Aidot lights."""
 
+import ctypes
 from typing import Any
 
 from homeassistant.components.light import (
@@ -9,6 +10,7 @@ from homeassistant.components.light import (
     ATTR_RGBW_COLOR,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
@@ -64,6 +66,7 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         self._effect_names = {code: name for name, code in self._effect_codes.items()}
         if self._effect_codes:
             self._attr_effect_list = list(self._effect_codes)
+            self._attr_supported_features = LightEntityFeature.EFFECT
         if coordinator.device_client.info.enable_rgbw:
             self._attr_color_mode = ColorMode.RGBW
             self._attr_supported_color_modes = {ColorMode.RGBW, ColorMode.COLOR_TEMP}
@@ -84,6 +87,9 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         self._attr_effect = self._effect_names.get(
             getattr(self.coordinator.data, "effect_mode", None)
         )
+        active_mode = getattr(self.coordinator.data, "active_color_mode", None)
+        if active_mode in self._attr_supported_color_modes:
+            self._attr_color_mode = ColorMode(active_mode)
 
     @property
     def available(self) -> bool:
@@ -97,35 +103,35 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         super()._handle_coordinator_update()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the light on, applying brightness, color temperature, RGBW, or plain on."""
+        """Apply the complete request in one packet, including on-from-off."""
+        attributes: dict[str, int] = {"OnOff": 1}
+        if ATTR_COLOR_TEMP_KELVIN in kwargs:
+            attributes["CCT"] = int(kwargs[ATTR_COLOR_TEMP_KELVIN])
+        if ATTR_RGBW_COLOR in kwargs:
+            rgbw = tuple(max(0, min(255, round(c))) for c in kwargs[ATTR_RGBW_COLOR])
+            packed = (rgbw[0] << 24) | (rgbw[1] << 16) | (rgbw[2] << 8) | rgbw[3]
+            attributes["RGBW"] = ctypes.c_int32(packed).value
+        if ATTR_EFFECT in kwargs:
+            attributes["EffectMode"] = self._effect_codes[kwargs[ATTR_EFFECT]]
         if ATTR_BRIGHTNESS in kwargs:
-            brightness = kwargs.get(ATTR_BRIGHTNESS, 255)
-            await self.coordinator.device_client.async_set_brightness(brightness)
-            self.coordinator.data.dimming = brightness
-            self._attr_brightness = brightness
-        elif ATTR_COLOR_TEMP_KELVIN in kwargs:
-            color_temp_kelvin = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
-            await self.coordinator.device_client.async_set_cct(color_temp_kelvin)
-            self.coordinator.data.cct = color_temp_kelvin
-            self._attr_color_temp_kelvin = color_temp_kelvin
-            self._attr_color_mode = ColorMode.COLOR_TEMP
-        elif ATTR_RGBW_COLOR in kwargs:
-            rgbw_color = kwargs.get(ATTR_RGBW_COLOR)
-            await self.coordinator.device_client.async_set_rgbw(rgbw_color)
-            self.coordinator.data.rgbw = rgbw_color
-            self._attr_rgbw_color = rgbw_color
-            self._attr_color_mode = ColorMode.RGBW
-        elif ATTR_EFFECT in kwargs:
-            effect = kwargs[ATTR_EFFECT]
-            await self.coordinator.device_client.async_set_effect(
-                self._effect_codes[effect]
-            )
-            self._attr_effect = effect
-        else:
-            await self.coordinator.device_client.async_turn_on()
+            attributes["Dimming"] = int(kwargs[ATTR_BRIGHTNESS] * 100 / 255)
 
-        self.coordinator.data.on = True
-        self._attr_is_on = True
+        # Both the Wi-Fi library and BLE adapter accept a complete attribute map.
+        # Do not send cached colour alongside brightness-only or plain-on calls.
+        await self.coordinator.device_client.send_dev_attr(attributes)
+        status = self.coordinator.data
+        status.on = True
+        if "CCT" in attributes:
+            status.cct = attributes["CCT"]
+            status.active_color_mode = ColorMode.COLOR_TEMP
+        if "RGBW" in attributes:
+            status.rgbw = rgbw
+            status.active_color_mode = ColorMode.RGBW
+        if "Dimming" in attributes:
+            status.dimming = int(attributes["Dimming"] * 255 / 100)
+        if "EffectMode" in attributes:
+            status.effect_mode = attributes["EffectMode"]
+        self._update_status()
         self.async_write_ha_state()
 
     async def async_turn_off(self, **kwargs: Any) -> None:

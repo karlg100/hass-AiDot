@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from aidot.const import CONF_COUNTRY, DEFAULT_COUNTRY_CODE, SUPPORTED_COUNTRYS
 from aidot.exceptions import AidotAuthFailed
+from aiohttp import ClientResponseError
 
 if TYPE_CHECKING:
     from aidot.client import AidotClient
@@ -15,13 +16,30 @@ _CONF_COUNTRY_CODE = "country_code"
 _LEGACY_LOGIN_INFO_KEYS = ("login_info", "loginInfo")
 
 
+def is_authentication_error(error: Exception) -> bool:
+    """Recognize typed auth failures and raw errors from a rejected refresh."""
+    if isinstance(error, AidotAuthFailed):
+        return True
+    if not isinstance(error, ClientResponseError):
+        return False
+    if error.status == 401:
+        return True
+    return (
+        error.status == 400
+        and error.request_info is not None
+        and error.request_info.real_url.path.endswith("/users/refreshToken")
+    )
+
+
 async def async_get_devices_with_relogin(
     client: AidotClient, on_login: Callable[[], None]
 ) -> dict[str, Any]:
     """Recover one invalid cloud session using the saved account credentials."""
     try:
         return await client.async_get_all_device()
-    except AidotAuthFailed:
+    except (AidotAuthFailed, ClientResponseError) as error:
+        if not is_authentication_error(error):
+            raise
         # A session can be invalidated even while the stored password is valid.
         # Retry only once; invalid credentials still enter HA's reauth flow.
         await client.async_post_login()

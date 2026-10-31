@@ -1,6 +1,6 @@
 """Coordinator for Aidot."""
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 import logging
 import time
 
@@ -14,6 +14,7 @@ from aidot.const import (
 )
 from aidot.device_client import DeviceClient, DeviceStatusData
 from aidot.exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
+from aiohttp import ClientResponseError
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -22,7 +23,7 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .auth import async_get_devices_with_relogin, get_login_data
+from .auth import async_get_devices_with_relogin, get_login_data, is_authentication_error
 from .ble_gateway_client import (
     BleGatewayDeviceClient,
     close_all_hub_sessions,
@@ -96,6 +97,11 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
         self.client.set_token_fresh_cb(self.token_fresh_cb)
         self.device_coordinators: dict[str, AidotDeviceUpdateCoordinator] = {}
         self._last_hub_refresh = time.monotonic()
+        self.cloud_status = {
+            "reauthenticationCount": 0,
+            "lastReauthentication": None,
+            "lastSuccessfulRefresh": None,
+        }
 
     async def _async_setup(self) -> None:
         """Set up the coordinator."""
@@ -103,16 +109,25 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             await self.async_auto_login()
         except AidotUserOrPassIncorrect as error:
             raise ConfigEntryAuthFailed from error
+        except ClientResponseError as error:
+            if is_authentication_error(error):
+                raise ConfigEntryAuthFailed from error
+            raise
 
     async def _async_update_data(self) -> None:
         """Update data async."""
         try:
             data = await async_get_devices_with_relogin(
-                self.client, self.token_fresh_cb
+                self.client, self._handle_cloud_relogin
             )
         except (AidotAuthFailed, AidotUserOrPassIncorrect) as error:
             raise ConfigEntryAuthFailed from error
+        except ClientResponseError as error:
+            if is_authentication_error(error):
+                raise ConfigEntryAuthFailed from error
+            raise
         self._last_hub_refresh = time.monotonic()
+        self.cloud_status["lastSuccessfulRefresh"] = datetime.now(UTC).isoformat()
 
         all_devices: list[dict] = data[CONF_DEVICE_LIST]
 
@@ -217,6 +232,12 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
                 **self.client.login_info,
             },
         )
+
+    def _handle_cloud_relogin(self) -> None:
+        """Save a recovered session and make successful recovery observable."""
+        self.token_fresh_cb()
+        self.cloud_status["reauthenticationCount"] += 1
+        self.cloud_status["lastReauthentication"] = datetime.now(UTC).isoformat()
 
     async def async_auto_login(self) -> None:
         """Async auto login."""
