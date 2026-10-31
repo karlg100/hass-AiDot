@@ -14,6 +14,7 @@ import pytest
 def light_module(monkeypatch):
     """Stub HA's entity plumbing, retaining the platform's command/state code."""
     class ColorMode(StrEnum):
+        ONOFF = "onoff"
         RGBW = "rgbw"
         COLOR_TEMP = "color_temp"
         BRIGHTNESS = "brightness"
@@ -215,3 +216,35 @@ async def test_failed_wifi_preset_does_not_claim_success(light_module):
 
     assert light._attr_is_on is False
     assert not getattr(light, "writes", 0)
+
+
+async def test_group_light_has_virtual_identity_assumed_state_and_onoff_only_mode(light_module):
+    light, client = make_light(light_module, on=None)
+    client.info.dev_id = "group:home:front"
+    client.info.name = "Example garden"
+    client.info.enable_dimming = False
+    client.info.enable_rgbw = False
+    client.info.enable_cct = False
+    client.info.cct_min, client.info.cct_max = 2700, 6500
+    client.report = {"memberCount": 14}
+    group = light_module.AidotGroupLight(light.coordinator)
+    assert group._attr_unique_id == "group:home:front"
+    assert group._attr_assumed_state is True
+    assert group._attr_is_on is None
+    assert group._attr_supported_color_modes == {light_module.ColorMode.ONOFF}
+    assert "connections" not in group._attr_device_info
+    assert group.extra_state_attributes == {"member_count": 14}
+    await group.async_turn_on()
+    client.send_dev_attr.assert_awaited_once_with({"OnOff": 1})
+
+
+async def test_group_light_uses_shared_color_and_brightness_command(light_module):
+    light, client = make_light(light_module, on=False)
+    client.info.enable_dimming = True
+    client.info.cct_min, client.info.cct_max = 2700, 6500
+    client.info.effects = {"Cycle": 5}
+    group = light_module.AidotGroupLight(light.coordinator)
+    await group.async_turn_on(rgbw_color=(0, 255, 0, 0), brightness=128)
+    client.send_dev_attr.assert_awaited_once_with({"OnOff": 1, "RGBW": 16711680, "Dimming": 50})
+    client.status.online = False
+    assert group.available is False

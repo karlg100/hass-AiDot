@@ -32,6 +32,20 @@ async def async_setup_entry(
         AidotLight(device_coordinator)
         for device_coordinator in coordinator.device_coordinators.values()
     )
+    known_groups: set[str] = set()
+
+    @callback
+    def add_groups() -> None:
+        entities = []
+        for unique_id, group_coordinator in coordinator.group_coordinators.items():
+            if unique_id not in known_groups:
+                known_groups.add(unique_id)
+                entities.append(AidotGroupLight(group_coordinator))
+        if entities:
+            async_add_entities(entities)
+
+    add_groups()
+    entry.async_on_unload(coordinator.async_add_listener(add_groups))
 
 
 class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
@@ -160,3 +174,41 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         self.coordinator.data.on = False
         self._attr_is_on = False
         self.async_write_ha_state()
+
+
+class AidotGroupLight(AidotLight):
+    """An existing app group, controlled through AiDot's cloud."""
+
+    _attr_assumed_state = True
+
+    def _update_status(self) -> None:
+        info = self.coordinator.device_client.info
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, info.dev_id)}, manufacturer="AiDot",
+            model="Mesh group", name=info.name,
+        )
+        self._effect_codes = info.effects
+        self._effect_names = {code: name for name, code in info.effects.items()}
+        self._attr_effect_list = list(info.effects) or None
+        self._attr_supported_features = LightEntityFeature.EFFECT if info.effects else 0
+        if info.enable_rgbw:
+            self._attr_supported_color_modes = {ColorMode.RGBW}
+            if info.enable_cct:
+                self._attr_supported_color_modes.add(ColorMode.COLOR_TEMP)
+            self._attr_color_mode = ColorMode.RGBW
+        elif info.enable_cct:
+            self._attr_supported_color_modes = {ColorMode.COLOR_TEMP}
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+        elif info.enable_dimming:
+            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+        else:
+            self._attr_supported_color_modes = {ColorMode.ONOFF}
+            self._attr_color_mode = ColorMode.ONOFF
+        self._attr_min_color_temp_kelvin = info.cct_min
+        self._attr_max_color_temp_kelvin = info.cct_max
+        super()._update_status()
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"member_count": self.coordinator.device_client.report["memberCount"]}

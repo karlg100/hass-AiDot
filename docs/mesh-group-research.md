@@ -46,7 +46,7 @@ It sends no device command and never edits group membership. Raw account/API
 responses and device names are not printed or written to an output file.
 `localCommandVerified` remains false until there is independent wire evidence.
 The tool was also run successfully with the installed python-aidot 0.3.58 API
-base (v35), finding the same 14-member group. All 107 automated tests pass,
+base (v35), finding the same 14-member group. The original research suite had 107 passing tests,
 including address classification, exact membership, shared-hub eligibility and
 output redaction checks added for this tool.
 
@@ -204,17 +204,47 @@ independent member reports, explicit read-back or physical observation.
 An unacknowledged mesh broadcast may not generate individual status reports;
 the lack of passive reports alone does not prove delivery failed.
 
-## HA integration work remaining
+## Additional group attributes verified
 
-The working cloud route needs an account-scoped MQTT client using a distinct
-WebPC session, existing HA token refresh, correlated replies and bounded
-timeouts. Group commands should not log credentials or automatically retry an
-operation whose delivery is uncertain. The protocol helper is a tested
-research component; it is not yet exposed as an HA light entity.
+A watched sequence using the new production cloud client sent half-bright
+blue, full-bright red, warm white, effect mode 5, steady green and off. Every
+compound request received a matching code-200 reply, 61 member reports arrived,
+and the user confirmed that every physical step worked. Acknowledgement times
+were respectively 243.3, 325.5, 522.0, 376.1, 262.1 and 215.3 ms. These are
+cloud-acceptance times, not instrumented physical latency.
 
-For a future local implementation, the actual hub group frame is still
-required. Do not send the cloud envelope over the local TCP transport and
-assume the two protocols are interchangeable.
+This validates `Dimming`, signed 32-bit `RGBW`, `CCT`, `EffectMode`, combined
+attributes, and clearing an effect with `EffectMode: 0` alongside a steady
+colour request. Effects beyond the tested mode are selected from the exact
+name/code intersection advertised by all group members; they have not each
+been physically tested. Colour temperature was checked qualitatively rather
+than measured with a colour meter.
+
+## HA integration (1.1.6-beta.2)
+
+The branch now contains group inventory validation, a protocol builder,
+an account-scoped cloud client and a group light adapter under
+`custom_components/aidot/group_*.py`. `coordinator.py` discovers owned groups,
+maintains separate group coordinators and routes real member notifications.
+`light.py` exposes existing app groups as ordinary light entities with only
+their shared, validated controls. Group IDs remain stable across app renames.
+Group state is assumed; it does not fabricate confirmations from every member.
+
+The cloud client validates TLS, obtains a distinct WebPC session, recovers
+expired tokens through HA's existing login and uses unique sequence IDs with
+bounded reply waits. Non-retained QoS-0 writes are never replayed on reconnect.
+Optional group failures do not disable local individual lights. Group dispatch
+drains outstanding local requests without replacing the per-device pipeline;
+this orders dispatch rather than guaranteeing physical ordering across paths.
+
+Tests cover compound requests, exact targets and complete reply attributes,
+thread-to-event-loop callbacks, timeouts without retry, fresh clients after
+disconnect, cancellation cleanup, capabilities shared by all members, group
+removal/re-addition, auth recovery, and notification routing without bulk state
+fabrication. HA installation and service validation are the final runtime checks.
+
+For a future local implementation, the actual hub group frame is still required.
+The cloud envelope and local TCP protocol are not interchangeable.
 
 1. Discover existing eligible AiDot groups and resolve every member to a hub.
 2. Use the verified cloud operation, or, once a local group frame is verified,
