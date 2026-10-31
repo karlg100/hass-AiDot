@@ -46,7 +46,7 @@ It sends no device command and never edits group membership. Raw account/API
 responses and device names are not printed or written to an output file.
 `localCommandVerified` remains false until there is independent wire evidence.
 The tool was also run successfully with the installed python-aidot 0.3.58 API
-base (v35), finding the same 14-member group. All 86 automated tests pass,
+base (v35), finding the same 14-member group. All 107 automated tests pass,
 including address classification, exact membership, shared-hub eligibility and
 output redaction checks added for this tool.
 
@@ -124,9 +124,53 @@ During controlled HA single-light on/off tests, the hub's broadcast channel
 yielded acknowledgements with code 200, the member's `devId` and `attr.OnOff`
 values 1 and 0. These establish acknowledgement visibility, not independent
 physical feedback or access to the phone's outgoing request. Spotlight 14 was
-returned to off. A bounded recorder is prepared for an app group test at this
-different observation point. The actual group request or app implementation
-is still required before adding a group write.
+returned to off.
+
+## Cloud group operation captured
+
+The synchronized cellular-only app test at the cloud observation point ran for
+72.785 seconds and recorded six messages. Two arrived on
+`iot/v1/c/{userId}/group/excGroupResp`, one for on and one for off. Each had
+`service: "group"`, `method: "excGroupResp"` and `ack.code: 200`. The echoed
+payload contained:
+
+```json
+{
+  "method": "set_prop",
+  "groupId": "<owned cloud group ID>",
+  "bleMeshGroupAddress": "<decimal mesh group address>",
+  "source": "<redacted app value>",
+  "params": {"OnOff": 1},
+  "homeId": "<owned home ID>"
+}
+```
+
+The off response used `OnOff: 0`. Four later hub broadcast messages, on
+`device/setDevAttrNotif`, reported two members on and then off. The two group
+responses were about 7.3 seconds apart. These are response/notification times,
+not measured phone-to-light latency, and the two reporting members cannot be
+treated as confirmation from all 14 lights.
+
+Using the observed response format and the official web client's documented
+server-request topic convention, a single off-only probe was sent to
+`iot/v1/s/{userId}/group/excGroupReq`. Its envelope used `method: "excGroupReq"`,
+`service: "group"`, a unique `seq`, `srcAddr: "0.{userId}"`, an integer Unix
+`tst`, the current WebPC `clientId` and the payload above with `OnOff: 0`.
+The probe omitted `source`. A matching `excGroupResp` with code 200 arrived in
+369.5 ms. This establishes cloud acceptance of that request; an off-only
+operation on already-off lights does not establish physical delivery.
+
+This is a cloud group API, not a verified local hub group frame. No native
+Bluetooth multicast or all-member latency improvement has yet been proven.
+
+`tools/cloud_group_protocol.py` contains the request builder and reply
+validator for this operation. It performs no network I/O. It reuses exact
+membership/shared-hub validation, supports only integer `OnOff` 0 or 1,
+and requires a WebPC client ID belonging to the selected user. Reply handling
+ignores unrelated topics/sequences and refuses an acknowledgement for a
+different group, home, mesh address or state. Its tests cover those cases
+and rejected acknowledgements without exposing upstream error details.
+Neither helper infers physical delivery from code 200 or retries a command.
 
 Do not present a successful hub acknowledgement as proof that all members
 received a command. Verification needs a single outgoing group request plus
