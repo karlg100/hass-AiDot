@@ -154,3 +154,64 @@ async def test_effects_are_advertised_when_metadata_has_them(light_module):
     assert light._attr_supported_features & light_module.LightEntityFeature.EFFECT
     await light.async_turn_on(effect="Rainbow", brightness=128)
     client.send_dev_attr.assert_awaited_once_with({"OnOff": 1, "EffectMode": 5, "Dimming": 50})
+
+
+async def test_wifi_preset_uses_real_upstream_primitive_api(light_module):
+    """Keep python-aidot 0.3.58's named presets distinct from BLE mode codes."""
+    from aidot.device_client import DeviceClient
+
+    light, client = make_light(light_module, on=False)
+    primitive = SimpleNamespace(primitiveEffectId="preset-id")
+    client.info.presets = {"Sunset": primitive}
+    client.info.preset_names = ["Sunset"]
+    client.client = SimpleNamespace(async_execute_diff_command=AsyncMock())
+    client.device_id = "light1"
+    client.async_set_effect = DeviceClient.async_set_effect.__get__(client)
+    light = light_module.AidotLight(light.coordinator)
+
+    await light.async_turn_on(effect="Sunset", brightness=128)
+
+    client.send_dev_attr.assert_awaited_once_with({"OnOff": 1, "Dimming": 50})
+    client.client.async_execute_diff_command.assert_awaited_once_with(
+        device_id="light1", primitive=primitive
+    )
+    assert light._attr_effect_list == ["Sunset"]
+    assert light._attr_effect == "Sunset"
+    assert light._attr_is_on is True
+
+
+async def test_static_colour_clears_wifi_preset_state(light_module):
+    light, client = make_light(light_module)
+    client.info.preset_names = ["Sunset"]
+    client.status.effect = "Sunset"
+    light = light_module.AidotLight(light.coordinator)
+    assert light._attr_effect == "Sunset"
+
+    await light.async_turn_on(rgbw_color=(0, 255, 0, 0), brightness=255)
+
+    assert light._attr_effect is None
+    assert client.status.effect == ""
+    client.async_set_effect.assert_not_awaited()
+
+
+async def test_wifi_preset_telemetry_updates_effect(light_module):
+    light, client = make_light(light_module)
+    client.info.preset_names = ["Sunset"]
+    client.status.effect = ""
+    light = light_module.AidotLight(light.coordinator)
+    client.status.effect = "Sunset"
+    light._handle_coordinator_update()
+    assert light._attr_effect == "Sunset"
+
+
+async def test_failed_wifi_preset_does_not_claim_success(light_module):
+    light, client = make_light(light_module, on=False)
+    client.info.preset_names = ["Sunset"]
+    client.async_set_effect.side_effect = ConnectionError("preset request failed")
+    light = light_module.AidotLight(light.coordinator)
+
+    with pytest.raises(ConnectionError):
+        await light.async_turn_on(effect="Sunset", brightness=128)
+
+    assert light._attr_is_on is False
+    assert not getattr(light, "writes", 0)
