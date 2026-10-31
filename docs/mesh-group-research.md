@@ -95,10 +95,38 @@ group operation. It cannot distinguish direct phone Bluetooth, phone LAN
 traffic outside the HA host's visibility, or a cloud path. Repeating the same
 capture point will not by itself reveal a command encoding.
 
-The next path check is app control with the phone's Bluetooth temporarily off.
-If that works physically, investigate the hub/network route. Otherwise,
-investigate the phone's mesh/Bluetooth command construction. The actual app
-request or app implementation is still required before adding a group write.
+The user then confirmed physical group on/off operation with Bluetooth off in
+iPhone Settings, followed by a second successful test with both Bluetooth and
+Wi-Fi off and cellular data on. This establishes a cloud-to-hub control path;
+direct phone Bluetooth and phone LAN access are not required for that path.
+It does not establish whether the cloud sends one mesh group request or fans
+out individual member commands, nor does it establish a latency improvement.
+
+## Cloud observation
+
+AiDot's [official web client](https://app.aidot.com/SignIn), examined on
+2026-10-31, obtains a per-session MQTT configuration from
+`GET /v29/commons/mqttConfig?source=WebPC&sessionId=...`. Its public bundle
+constructs a TLS WebSocket connection to the returned host at `/mqtt` and
+contains the ordinary individual `setDevAttrReq` builder. No mesh group
+request builder was found in that bundle; this is not evidence that the
+phone app lacks one.
+
+A bounded read-only observer authenticated successfully using the existing
+HA account token and a separate WebPC session nonce. TLS certificate
+validation remained enabled. The broker accepted the account's client
+notification channel and the owned hub's broadcast channel, but rejected
+subscriptions to the server-request, hub-client and user-broadcast channels.
+Those rejected subscriptions were not retried or bypassed. No cloud device
+command was published, and no MQTT password was saved.
+
+During controlled HA single-light on/off tests, the hub's broadcast channel
+yielded acknowledgements with code 200, the member's `devId` and `attr.OnOff`
+values 1 and 0. These establish acknowledgement visibility, not independent
+physical feedback or access to the phone's outgoing request. Spotlight 14 was
+returned to off. A bounded recorder is prepared for an app group test at this
+different observation point. The actual group request or app implementation
+is still required before adding a group write.
 
 Do not present a successful hub acknowledgement as proof that all members
 received a command. Verification needs a single outgoing group request plus
