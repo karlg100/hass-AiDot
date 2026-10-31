@@ -25,6 +25,7 @@ _MAX_RETRIES = 3
 _BACKOFF = 0.5
 _MAX_RECONNECT_BACKOFF = 60
 _HUB_KEEPALIVE_INTERVAL = 30
+_HUB_IDLE_TIMEOUT = 90
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -242,7 +243,7 @@ class BleDeviceInfo:
 
 @dataclass
 class BleDeviceStatus:
-    online: bool = True
+    online: bool = False
     on: bool = False
     dimming: int = 255
     cct: int = 2700
@@ -307,6 +308,35 @@ class _HubSession:
         self._device_update_counts: dict[str, int] = {}
         self._last_device_update: dict[str, datetime] = {}
         self._last_device_attributes: dict[str, tuple[str, ...]] = {}
+        self._on_login_failure: Callable[[], None] | None = None
+        self._connection_stage = "disconnected"
+        self._last_connection_error: dict[str, Any] | None = None
+        self._connection_attempts = 0
+        self._last_successful_login: datetime | None = None
+
+    async def async_update_connection(
+        self,
+        hub_ip: str,
+        aes_key: bytes,
+        user_id: str,
+        hub_password: str,
+        on_login_failure: Callable[[], None] | None = None,
+    ) -> None:
+        """Refresh the shared session in place, preserving every light listener."""
+        self._on_login_failure = on_login_failure
+        if (hub_ip, aes_key, user_id, hub_password) == (
+            self._hub_ip, self._aes_key, self._user_id, self._hub_password
+        ):
+            return
+        async with self._request_lock:
+            await self._stop_reconnect()
+            async with self._connection_lock:
+                await self._drop_connection()
+                self._hub_ip = hub_ip
+                self._aes_key = aes_key
+                self._user_id = user_id
+                self._hub_password = hub_password
+                self._closing = False
 
     @property
     def connected(self) -> bool:
@@ -338,6 +368,8 @@ class _HubSession:
         """Close a hub session after its final BLE device is removed."""
         if not self._device_listeners:
             await self.close()
+            if _HUB_SESSIONS.get(self._hub_id) is self:
+                _HUB_SESSIONS.pop(self._hub_id)
 
     async def start(self) -> None:
         """Start the passive listener without failing integration setup."""
@@ -432,11 +464,16 @@ class _HubSession:
                 return
             try:
                 await self._connect_and_login()
-            except Exception:
+            except Exception as error:
+                self._record_connection_error(error)
                 await self._drop_connection()
+                if self._on_login_failure:
+                    self._on_login_failure()
                 raise
 
     async def _connect_and_login(self) -> None:
+        self._connection_attempts += 1
+        self._connection_stage = "tcp_connect"
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_connection(self._hub_ip, _HUB_PORT), timeout=_TIMEOUT
         )
@@ -454,8 +491,10 @@ class _HubSession:
                 "ascNumber": 1,
             },
         }).encode()
+        self._connection_stage = "login_send"
         self._writer.write(_frame(login, self._aes_key))
         await self._writer.drain()
+        self._connection_stage = "login_response"
         resp = await _recv(self._reader, self._aes_key)
         ack = resp.get("ack")
         if isinstance(ack, dict) and ack.get("code") not in (None, 200):
@@ -463,6 +502,8 @@ class _HubSession:
                 f"BLE hub login failed with code {ack.get('code')}"
             )
         self._asc = resp.get("payload", {}).get("ascNumber", 1) + 1
+        self._connection_stage = "connected"
+        self._last_successful_login = datetime.now(UTC)
         self._reader_task = asyncio.create_task(
             self._receive_loop(self._reader),
             name=f"aidot_ble_hub_receive_{self._anonymous_hub_id}",
@@ -504,12 +545,15 @@ class _HubSession:
         cancelled = False
         try:
             while True:
-                response = await _recv(reader, self._aes_key, timeout=None)
+                response = await _recv(
+                    reader, self._aes_key, timeout=_HUB_IDLE_TIMEOUT
+                )
                 self._route_response(response)
         except asyncio.CancelledError:
             cancelled = True
             raise
         except Exception as error:  # noqa: BLE001 - any read failure reconnects
+            self._record_connection_error(error)
             _LOGGER.debug(
                 "BLE hub listener %s disconnected: %s",
                 self._anonymous_hub_id,
@@ -625,6 +669,7 @@ class _HubSession:
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - reconnect on any socket error
+            self._record_connection_error(error)
             _LOGGER.debug(
                 "BLE hub keepalive %s failed: %s",
                 self._anonymous_hub_id,
@@ -675,6 +720,7 @@ class _HubSession:
         if expected_reader is not None and self._reader is not expected_reader:
             return
         was_connected = self._writer is not None
+        self._connection_stage = "disconnected"
         current_task = asyncio.current_task()
         reader_task = self._reader_task
         keepalive_task = self._keepalive_task
@@ -708,7 +754,7 @@ class _HubSession:
         if writer is not None:
             try:
                 writer.close()
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=_TIMEOUT)
             except Exception:  # noqa: BLE001 - closing is best-effort
                 pass
 
@@ -733,6 +779,13 @@ class _HubSession:
     async def close(self) -> None:
         """Stop reconnecting and close the passive hub listener."""
         self._closing = True
+        await self._stop_reconnect()
+        await self._drop_connection()
+        self._device_listeners.clear()
+        self._connection_listeners.clear()
+
+    async def _stop_reconnect(self) -> None:
+        """Stop the background connector before changing settings or unloading."""
         reconnect_task = self._reconnect_task
         self._reconnect_task = None
         if (
@@ -744,9 +797,15 @@ class _HubSession:
                 await reconnect_task
             except asyncio.CancelledError:
                 pass
-        await self._drop_connection()
-        self._device_listeners.clear()
-        self._connection_listeners.clear()
+
+    def _record_connection_error(self, error: Exception) -> None:
+        """Keep useful failure details without retaining exception text or secrets."""
+        self._last_connection_error = {
+            "stage": self._connection_stage,
+            "type": type(error).__name__,
+            "errno": error.errno if isinstance(error, OSError) else None,
+            "time": datetime.now(UTC).isoformat(),
+        }
 
     def device_diagnostics(self, dev_id: str) -> dict[str, Any]:
         """Return identifier-free passive listener diagnostics for one device."""
@@ -756,6 +815,13 @@ class _HubSession:
             "mode": "passive_hub_listener",
             "connected": self.connected,
             "registered": dev_id in self._device_listeners,
+            "connectionStage": self._connection_stage,
+            "connectionAttempts": self._connection_attempts,
+            "lastConnectionError": self._last_connection_error,
+            "lastSuccessfulLogin": (
+                self._last_successful_login.isoformat()
+                if self._last_successful_login else None
+            ),
             "receivedFrameCount": self._received_frames,
             "unroutedUpdateCount": self._unrouted_updates,
             "deviceUpdateCount": self._device_update_counts.get(dev_id, 0),
@@ -783,7 +849,7 @@ def _get_hub_session(
 ) -> _HubSession:
     """Return the shared session for a hub, creating it on first use."""
     session = _HUB_SESSIONS.get(hub_id)
-    if session is None or session._hub_ip != hub_ip:
+    if session is None:
         session = _HubSession(hub_id, hub_ip, aes_key, user_id, hub_password)
         _HUB_SESSIONS[hub_id] = session
     return session
@@ -792,7 +858,11 @@ def _get_hub_session(
 async def start_all_hub_sessions() -> None:
     """Start one passive listener for every registered BLE hub."""
     await asyncio.gather(
-        *(session.start() for session in list(_HUB_SESSIONS.values()))
+        *(
+            session.start()
+            for session in list(_HUB_SESSIONS.values())
+            if session._device_listeners
+        )
     )
 
 
@@ -880,7 +950,7 @@ class BleGatewayDeviceClient:
         rgbw_u = ctypes.c_uint32(raw_rgbw).value
 
         self.status = BleDeviceStatus(
-            online=True,
+            online=False,
             on=int(props.get("OnOff", 0)) == 1,
             dimming=int(raw_dim * 255 / 100),
             cct=int(props.get("CCT", cct_min)),
@@ -915,6 +985,32 @@ class BleGatewayDeviceClient:
             self._device_id,
             self._handle_hub_update,
             self._handle_hub_connection,
+        )
+
+    async def async_update_hub(
+        self,
+        hub_device: dict[str, Any],
+        user_id: str,
+        on_login_failure: Callable[[], None] | None = None,
+    ) -> None:
+        """Apply refreshed hub credentials and gateway changes to this light."""
+        self._diagnostic_secrets.update(_diagnostic_secret_values(hub_device))
+        hub_id = hub_device["id"]
+        hub_ip = hub_device.get("properties", {}).get("ipAddress", "")
+        aes_key = _make_aes_key((hub_device.get("aesKey") or [None])[0] or "")
+        password = hub_device.get("password", "")
+        session = _get_hub_session(hub_id, hub_ip, aes_key, user_id, password)
+        if session is not self._hub_session:
+            old_session = self._hub_session
+            old_session.unregister_device(self._device_id)
+            await old_session.stop_if_unused()
+            self._hub_session = session
+            self._hub_id = hub_id
+            session.register_device(
+                self._device_id, self._handle_hub_update, self._handle_hub_connection
+            )
+        await session.async_update_connection(
+            hub_ip, aes_key, user_id, password, on_login_failure
         )
 
     def update_cloud_properties(self, device: dict[str, Any]) -> None:
@@ -1024,6 +1120,7 @@ class BleGatewayDeviceClient:
 
     def _handle_hub_connection(self, connected: bool) -> None:
         """Expose whether the passive path to the powered hub is available."""
+        self.status.online = connected
         self.status.telemetry_connected = connected
         if self.on_status_update:
             self.on_status_update(self.status)
