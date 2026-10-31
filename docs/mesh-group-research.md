@@ -241,7 +241,21 @@ Tests cover compound requests, exact targets and complete reply attributes,
 thread-to-event-loop callbacks, timeouts without retry, fresh clients after
 disconnect, cancellation cleanup, capabilities shared by all members, group
 removal/re-addition, auth recovery, and notification routing without bulk state
-fabrication. HA installation and service validation are the final runtime checks.
+fabrication. All 146 automated tests pass, and the changed runtime modules pass
+the code checks.
+
+The beta was installed on HA 2026.10.4 after verifying all 19 integration files
+against the published commit and saving a rollback backup. The registered
+14-member group exposes RGBW, colour temperature and the common advertised
+effects. Five ordinary HA light actions passed: blue with brightness 128,
+warm white at 2700 K, Bonfire, steady green, and off. HA service times ranged
+from 225.6 to 527.7 ms; group states and mode/attribute conversions matched.
+
+An entry reload re-established its cloud connection with zero commands replayed
+and preserved the group entity ID. Individual local control was checked after
+the group tests and reload: on/off passed in 15.2/14.7 ms. The cloud and local
+hub connections remained healthy, and the test lights finished off. These are
+small functional checks rather than an end-to-end latency benchmark.
 
 For a future local implementation, the actual hub group frame is still required.
 The cloud envelope and local TCP protocol are not interchangeable.

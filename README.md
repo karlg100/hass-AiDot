@@ -157,6 +157,18 @@ Group dispatch is ordered against pending local hub requests. A cloud reply
 is not a physical-delivery barrier across the two transports. Avoid having
 separate controllers issue competing group and individual changes.
 
+Target the app group's light entity in dashboards, scenes and automations.
+For example, for a group that exposes RGBW:
+
+```yaml
+action: light.turn_on
+target:
+  entity_id: light.example_garden
+data:
+  rgbw_color: [0, 255, 0, 0]
+  brightness_pct: 50
+```
+
 ## Troubleshooting
 
 ### Authentication fails
