@@ -160,8 +160,34 @@ The probe omitted `source`. A matching `excGroupResp` with code 200 arrived in
 369.5 ms. This establishes cloud acceptance of that request; an off-only
 operation on already-off lights does not establish physical delivery.
 
-This is a cloud group API, not a verified local hub group frame. No native
-Bluetooth multicast or all-member latency improvement has yet been proven.
+### Watched prototype on/off test
+
+The tested request builder was then used from the HA Core container to send
+one group-on request, hold for eight seconds after acceptance, and send one
+group-off request. Both replies matched the requested group, home, address,
+state and sequence and returned code 200:
+
+| Operation | Cloud acknowledgement latency |
+| --- | --- |
+| Group on | 297.8 ms |
+| Group off | 193.6 ms |
+
+The process completed successfully after exactly two outgoing cloud group
+requests, with no local requests and no fallback cleanup required. The user
+watched and confirmed that all the lights followed the on/off sequence
+together. This establishes physical group control using the prototype, with
+the `source` field omitted. The lights finished off.
+
+Hub broadcast reports were incomplete: three members reported on, and one
+reported off within the observation window. They do not replace the user's
+physical confirmation. The measured times above end at cloud acceptance;
+phone-to-light latency and the spread between individual light changes were
+not instrumented. They cannot be treated as a measured speedup over the
+approximately 2.7-second individual-command baseline.
+
+This verifies a cloud group API. The cloud-to-hub wire operation and any
+native Bluetooth multicast remain unverified; the cloud or hub could still
+fan out to members internally.
 
 `tools/cloud_group_protocol.py` contains the request builder and reply
 validator for this operation. It performs no network I/O. It reuses exact
@@ -178,12 +204,23 @@ independent member reports, explicit read-back or physical observation.
 An unacknowledged mesh broadcast may not generate individual status reports;
 the lack of passive reports alone does not prove delivery failed.
 
-## Implementation once the command is verified
+## HA integration work remaining
+
+The working cloud route needs an account-scoped MQTT client using a distinct
+WebPC session, existing HA token refresh, correlated replies and bounded
+timeouts. Group commands should not log credentials or automatically retry an
+operation whose delivery is uncertain. The protocol helper is a tested
+research component; it is not yet exposed as an HA light entity.
+
+For a future local implementation, the actual hub group frame is still
+required. Do not send the cloud envelope over the local TCP transport and
+assume the two protocols are interchangeable.
 
 1. Discover existing eligible AiDot groups and resolve every member to a hub.
-2. Add one explicit group request to the existing shared `_HubSession` reader
-   and acknowledgement dispatcher. Keep it ordered against member commands;
-   independent group and per-light locks must not permit conflicting writes.
+2. Use the verified cloud operation, or, once a local group frame is verified,
+   add it to the existing shared `_HubSession` reader and acknowledgement
+   dispatcher. Coordinate group writes with member commands; separate locks
+   must not permit conflicting writes.
 3. Expose the app group as its own HA light, supporting only attributes proven
    to work. A caller selecting ordinary individual entities keeps the existing
    semantics; do not silently broadcast to unselected group members.
