@@ -1209,7 +1209,14 @@ class BleGatewayDeviceClient:
 
     def handle_cloud_notification(self, attributes: dict[str, Any]) -> None:
         """Apply an actual member notification routed from its known hub."""
-        self._handle_hub_update(attributes)
+        local_online = self.status.online
+        if not self._apply_attributes(attributes, record_freshness=True):
+            return
+        # A cloud report proves fresh telemetry, not that HA can reach the
+        # individual light's local control transport.
+        self.status.online = local_online
+        if self.on_status_update:
+            self.on_status_update(self.status)
 
     async def async_run_group_command(self, operation: Any) -> Any:
         return await self._hub_session.run_group_command(operation)

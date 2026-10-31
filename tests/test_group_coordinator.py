@@ -214,6 +214,11 @@ async def test_route_only_actual_member_notifications_from_known_hub(
         )
         assert client.status.on is True and client.status.battery == 64
         assert client.status.last_telemetry_update is not None
+        assert client.status.online is False
+        assert client.status.telemetry_connected is True
+        client._handle_hub_connection(True)
+        manager._handle_group_cloud_message("iot/v1/cb/hub/device/setDevAttrNotif", message)
+        assert client.status.online is True
         assert manager.device_coordinators["two"].device_client.status.on is False
     finally:
         await manager.async_cleanup()
