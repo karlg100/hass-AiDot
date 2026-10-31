@@ -26,6 +26,7 @@ _BACKOFF = 0.5
 _MAX_RECONNECT_BACKOFF = 60
 _HUB_KEEPALIVE_INTERVAL = 30
 _HUB_IDLE_TIMEOUT = 90
+_MAX_IN_FLIGHT = 4
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -260,6 +261,11 @@ class BleDeviceStatus:
     security_alarm: bool | None = None
     alarm_status: bool | None = None
     effect_mode: int | None = None
+    active_color_mode: str | None = None
+
+
+class HubCommandError(Exception):
+    """A command reached the hub but was explicitly rejected."""
 
 
 _seq = 0
@@ -289,6 +295,8 @@ class _HubSession:
         self._hub_password = hub_password
         self._connection_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
+        self._command_slots = asyncio.Semaphore(_MAX_IN_FLIGHT)
+        self._device_request_locks: dict[str, asyncio.Lock] = {}
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
@@ -313,6 +321,9 @@ class _HubSession:
         self._last_connection_error: dict[str, Any] | None = None
         self._connection_attempts = 0
         self._last_successful_login: datetime | None = None
+        self._acknowledged_commands = 0
+        self._max_pending_requests = 0
+        self._last_command_latency_ms: float | None = None
 
     async def async_update_connection(
         self,
@@ -406,57 +417,88 @@ class _HubSession:
         *,
         collect_attribute_response: bool = False,
     ) -> list[dict]:
-        """Write a request and await only responses routed to its sequence."""
-        async with self._request_lock:
-            for attempt in range(_MAX_RETRIES):
-                seq: str | None = None
-                try:
+        """Pipeline different lights, retaining command order for each light."""
+        device_lock = self._device_request_locks.setdefault(dev_id, asyncio.Lock())
+        async with device_lock, self._command_slots:
+            return await self._request_with_retries(
+                method, dev_id, attr, collect_attribute_response=collect_attribute_response
+            )
+
+    async def _request_with_retries(
+        self,
+        method: str,
+        dev_id: str,
+        attr: dict | list[str],
+        *,
+        collect_attribute_response: bool,
+    ) -> list[dict]:
+        """Serialize socket writes; wait for correlated replies outside the lock."""
+        for attempt in range(_MAX_RETRIES):
+            seq: str | None = None
+            request_reader: asyncio.StreamReader | None = None
+            try:
+                async with self._request_lock:
                     await self._ensure_connected()
+                    request_reader = self._reader
                     seq, command = self._make_attr_request(method, dev_id, attr)
                     response_queue: asyncio.Queue[dict | BaseException] = (
                         asyncio.Queue()
                     )
                     self._pending[seq] = response_queue
+                    self._max_pending_requests = max(
+                        self._max_pending_requests, len(self._pending)
+                    )
                     for early_response in self._early_responses.pop(seq, []):
                         response_queue.put_nowait(early_response)
                     if self._writer is None:
                         raise ConnectionError("BLE hub writer is unavailable")
+                    command_started = time.monotonic()
                     self._writer.write(_frame(command, self._aes_key))
                     await self._writer.drain()
 
-                    responses = [
-                        await self._wait_for_response(response_queue, _TIMEOUT)
-                    ]
-                    if collect_attribute_response and not self._has_attributes(
-                        responses
-                    ):
-                        try:
-                            responses.append(
-                                await self._wait_for_response(
-                                    response_queue,
-                                    _DIAGNOSTIC_FOLLOWUP_TIMEOUT,
-                                )
+                responses = [await self._wait_for_response(response_queue, _TIMEOUT)]
+                ack = responses[0].get("ack")
+                if isinstance(ack, dict) and ack.get("code") not in (None, 200):
+                    raise HubCommandError(
+                        f"AiDot hub rejected {method} (code {ack['code']})"
+                    )
+                if method == "setDevAttrReq":
+                    self._acknowledged_commands += 1
+                    self._last_command_latency_ms = round(
+                        (time.monotonic() - command_started) * 1000, 1
+                    )
+                if collect_attribute_response and not self._has_attributes(responses):
+                    try:
+                        responses.append(
+                            await self._wait_for_response(
+                                response_queue, _DIAGNOSTIC_FOLLOWUP_TIMEOUT
                             )
-                        except asyncio.TimeoutError:
-                            pass
-                    return responses
-                except (
-                    ConnectionError,
-                    asyncio.TimeoutError,
-                    asyncio.IncompleteReadError,
-                    OSError,
-                ):
-                    await self._drop_connection()
-                    if attempt == _MAX_RETRIES - 1:
-                        self._schedule_reconnect()
-                        raise
-                    await asyncio.sleep(_BACKOFF * (attempt + 1))
-                finally:
-                    if seq is not None:
-                        self._pending.pop(seq, None)
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                return responses
+            except (
+                ConnectionError,
+                asyncio.TimeoutError,
+                asyncio.IncompleteReadError,
+                OSError,
+            ):
+                if request_reader is not None:
+                    async with self._request_lock, self._connection_lock:
+                        # Another pending request may already have reconnected.
+                        await self._drop_connection(expected_reader=request_reader)
+                if attempt == _MAX_RETRIES - 1 or self._closing:
+                    self._schedule_reconnect()
+                    raise
+                await asyncio.sleep(_BACKOFF * (attempt + 1))
+            finally:
+                if seq is not None:
+                    self._pending.pop(seq, None)
         return []
 
     async def _ensure_connected(self) -> None:
+        if self._closing:
+            raise ConnectionError("BLE hub session is closed")
         if self.connected:
             return
         async with self._connection_lock:
@@ -651,12 +693,14 @@ class _HubSession:
 
     async def _keepalive_loop(self) -> None:
         """Keep the powered hub connection alive without querying BLE lights."""
+        reader = None
         try:
             while True:
                 await asyncio.sleep(_HUB_KEEPALIVE_INTERVAL)
                 async with self._request_lock:
                     if not self.connected or self._writer is None:
                         return
+                    reader = self._reader
                     ping = json.dumps({
                         "service": "test",
                         "method": "pingreq",
@@ -675,7 +719,9 @@ class _HubSession:
                 self._anonymous_hub_id,
                 type(error).__name__,
             )
-            await self._drop_connection(cancel_keepalive=False)
+            await self._drop_connection(
+                cancel_keepalive=False, expected_reader=reader
+            )
             self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
@@ -724,8 +770,21 @@ class _HubSession:
         current_task = asyncio.current_task()
         reader_task = self._reader_task
         keepalive_task = self._keepalive_task
+        writer = self._writer
         self._reader_task = None
         self._keepalive_task = None
+        # Detach this transport before the first await. A new connection may be
+        # established while the old reader/writer finishes closing.
+        self._reader = None
+        self._writer = None
+        error = ConnectionError("BLE hub connection closed")
+        for response_queue in list(self._pending.values()):
+            response_queue.put_nowait(error)
+        self._early_responses.clear()
+        if was_connected:
+            self._notify_connection_state(False)
+        if writer is not None:
+            writer.close()
 
         if (
             cancel_reader
@@ -748,22 +807,11 @@ class _HubSession:
             except asyncio.CancelledError:
                 pass
 
-        writer = self._writer
-        self._reader = None
-        self._writer = None
         if writer is not None:
             try:
-                writer.close()
                 await asyncio.wait_for(writer.wait_closed(), timeout=_TIMEOUT)
             except Exception:  # noqa: BLE001 - closing is best-effort
                 pass
-
-        error = ConnectionError("BLE hub connection closed")
-        for response_queue in self._pending.values():
-            response_queue.put_nowait(error)
-        self._early_responses.clear()
-        if was_connected:
-            self._notify_connection_state(False)
 
     def _notify_connection_state(self, connected: bool) -> None:
         """Notify devices when their shared passive transport changes state."""
@@ -818,6 +866,11 @@ class _HubSession:
             "connectionStage": self._connection_stage,
             "connectionAttempts": self._connection_attempts,
             "lastConnectionError": self._last_connection_error,
+            "commandConcurrencyLimit": _MAX_IN_FLIGHT,
+            "pendingRequests": len(self._pending),
+            "maxPendingRequests": self._max_pending_requests,
+            "acknowledgedCommands": self._acknowledged_commands,
+            "lastCommandLatencyMs": self._last_command_latency_ms,
             "lastSuccessfulLogin": (
                 self._last_successful_login.isoformat()
                 if self._last_successful_login else None
@@ -972,6 +1025,9 @@ class BleGatewayDeviceClient:
             security_alarm=_parse_alarm(props.get("SecurityAlarm")),
             alarm_status=_parse_alarm(props.get("alarmStatus")),
             effect_mode=_parse_int(props.get("EffectMode"), 0, 65535),
+            active_color_mode={"RGBW": "rgbw", "CCT": "color_temp"}.get(
+                props.get("lastNotifyCctRgbw")
+            ),
         )
         self.on_status_update: Any = None
         self._hub_session = _get_hub_session(
@@ -1088,6 +1144,8 @@ class BleGatewayDeviceClient:
             value = _parse_int(attributes["CCT"], 0, 100000)
             if value is not None:
                 self.status.cct = value
+                if "RGBW" not in attributes:
+                    self.status.active_color_mode = "color_temp"
                 received = True
         if "RGBW" in attributes:
             try:
@@ -1103,7 +1161,16 @@ class BleGatewayDeviceClient:
                         (packed >> 8) & 0xFF,
                         packed & 0xFF,
                     )
+                    if "CCT" not in attributes:
+                        self.status.active_color_mode = "rgbw"
                     received = True
+
+        reported_mode = {"RGBW": "rgbw", "CCT": "color_temp"}.get(
+            attributes.get("lastNotifyCctRgbw")
+        )
+        if reported_mode:
+            self.status.active_color_mode = reported_mode
+            received = True
 
         if received and record_freshness:
             self.status.online = True
@@ -1146,25 +1213,13 @@ class BleGatewayDeviceClient:
 
     async def _send(self, attr: dict) -> None:
         await self._hub_session.send_command(self._device_id, attr)
-
-        if "OnOff" in attr:
-            self.status.on = bool(attr["OnOff"])
-        if "Dimming" in attr:
-            self.status.dimming = int(attr["Dimming"] * 255 / 100)
-        if "CCT" in attr:
-            self.status.cct = attr["CCT"]
-        if "RGBW" in attr:
-            packed = ctypes.c_uint32(attr["RGBW"]).value
-            self.status.rgbw = (
-                (packed >> 24) & 0xFF,
-                (packed >> 16) & 0xFF,
-                (packed >> 8) & 0xFF,
-                packed & 0xFF,
-            )
-        if "EffectMode" in attr:
-            self.status.effect_mode = int(attr["EffectMode"])
+        self._apply_attributes(attr, record_freshness=False)
         if self.on_status_update:
             self.on_status_update(self.status)
+
+    async def send_dev_attr(self, attributes: dict[str, int]) -> None:
+        """Match the Wi-Fi client's batch attribute API for compound commands."""
+        await self._send(attributes)
 
     async def async_turn_on(self) -> None:
         await self._send({"OnOff": 1})

@@ -6,6 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from aidot.exceptions import AidotAuthFailed, AidotUserOrPassIncorrect
+from aidot.client import AidotClient
+from aiohttp import ClientResponseError
+from yarl import URL
 import pytest
 
 _AUTH_PATH = (
@@ -106,3 +109,64 @@ async def test_repeated_invalid_session_does_not_loop() -> None:
         await auth.async_get_devices_with_relogin(client, Mock())
     client.async_post_login.assert_awaited_once()
     assert client.async_get_all_device.await_count == 2
+
+
+def response_error(status, path):
+    return ClientResponseError(
+        SimpleNamespace(real_url=URL("https://prod-us-api.arnoo.com/v17" + path)),
+        (), status=status,
+    )
+
+
+@pytest.mark.parametrize("status", [400, 401])
+async def test_real_library_rejected_refresh_recovers_without_reload(monkeypatch, status):
+    """0.3.56 propagates raw refresh HTTP errors instead of AidotAuthFailed."""
+    class Response:
+        def __init__(self, body, error=None):
+            self.body, self.error = body, error
+
+        async def json(self):
+            return self.body
+
+        def raise_for_status(self):
+            if self.error:
+                raise self.error
+
+    old_token = {
+        "id": "user1", "username": "test@example.com", "password": "test-password",
+        "region": "us", "country": "United States", "accessToken": "old-access",
+        "refreshToken": "old-refresh",
+    }
+    new_token = {**old_token, "accessToken": "new-access", "refreshToken": "new-refresh"}
+    session = SimpleNamespace(
+        get=AsyncMock(side_effect=[
+            Response({"code": 21026}, response_error(401, "/houses")), Response([]),
+        ]),
+        post=AsyncMock(side_effect=[
+            Response({"code": 21026}, response_error(status, "/users/refreshToken")),
+            Response(new_token.copy()),
+        ]),
+    )
+    monkeypatch.setattr(AidotClient, "setup_discover", lambda self: None)
+    client = AidotClient(session=session, token=old_token)
+    client.get_terminal_id = AsyncMock(return_value="test-terminal")
+    saved = []
+    result = await auth.async_get_devices_with_relogin(
+        client, lambda: saved.append(client.login_info.copy())
+    )
+    assert result == {"device_list": []}
+    assert len(saved) == 1 and saved[0]["accessToken"] == "new-access"
+    assert session.get.await_count == 2
+    assert session.get.await_args_list[-1].kwargs["headers"]["Token"] == "new-access"
+    assert session.post.await_count == 2
+
+
+@pytest.mark.parametrize("status,path", [(500, "/houses"), (400, "/devices")])
+async def test_non_auth_http_errors_do_not_trigger_password_login(status, path):
+    client = SimpleNamespace(
+        async_get_all_device=AsyncMock(side_effect=response_error(status, path)),
+        async_post_login=AsyncMock(),
+    )
+    with pytest.raises(ClientResponseError):
+        await auth.async_get_devices_with_relogin(client, Mock())
+    client.async_post_login.assert_not_awaited()
