@@ -13,10 +13,11 @@
   ],
   "documentation": "https://www.home-assistant.io/integrations/aidot",
   "integration_type": "hub",
-  "iot_class": "local_push",
+  "iot_class": "cloud_push",
   "quality_scale": "bronze",
   "requirements": [
-    "python-aidot==0.3.58"
+    "python-aidot==0.3.58",
+    "paho-mqtt==2.1.0"
   ],
-  "version": "1.1.6-beta.1"
+  "version": "1.1.6-beta.2"
 }

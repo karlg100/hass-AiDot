@@ -23,6 +23,19 @@ async def async_get_config_entry_diagnostics(
 
     return {
         "cloudSession": entry.runtime_data.cloud_status.copy(),
+        "cloudGroups": {
+            **entry.runtime_data.group_status,
+            "connection": entry.runtime_data.group_cloud.diagnostics.copy(),
+            "groups": [
+                {
+                    **coordinator.device_client.report,
+                    "available": coordinator.device_client.status.online,
+                    "assumedState": True,
+                    "lastAcknowledgementMs": coordinator.device_client.last_acknowledgement_ms,
+                }
+                for coordinator in entry.runtime_data.group_coordinators.values()
+            ],
+        },
         "bleGatewayDeviceCount": len(devices),
         "bleGatewayDevices": devices,
     }

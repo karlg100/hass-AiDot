@@ -22,6 +22,7 @@ automations.
 - Passive battery, charging, connectivity, and other advertised telemetry
 - Combined on/off, colour, and brightness requests
 - Named Wi-Fi presets and advertised BLE effects
+- Existing AiDot app groups exposed as separate light entities
 - Device availability and automatic reconnection
 - Account reauthentication through Home Assistant
 - Installation and updates through HACS
@@ -121,9 +122,52 @@ upstream library's named-effect API; BLE effects are exposed only when product
 metadata supplies names and numeric mode codes.
 
 Four commands to different BLE lights may be in flight together, with command
-order preserved for each light. There is no verified native mesh group or
-broadcast control command. An ordinary HA light group still sends individual
-device commands and does not guarantee simultaneous changes.
+order preserved for each light. An ordinary HA light group sends individual
+device commands. App group entities use the separate cloud group operation
+described below; the underlying BLE multicast encoding remains unverified.
+
+## AiDot app groups
+
+Create a normal mesh group in the AiDot phone app. The integration discovers
+eligible groups in homes you own and adds a separate light entity for each.
+Every member must be a supported BLE light attached to the same known hub.
+Groups are never created, edited or paired by this integration.
+
+Each group action sends one request to AiDot's cloud using your existing
+account. Group control requires internet access. The plugin maintains its own
+messaging session; no additional account or MQTT broker configuration is
+needed. Individual lights continue to use their local transport.
+
+Group state represents the last accepted group command and is marked as
+assumed. A cloud acknowledgement does not prove every member received it.
+Actual member notifications update the corresponding individual light and
+telemetry entities; the integration never creates reports for silent members.
+Individual changes do not automatically establish the aggregate group state.
+
+Connection loss makes group entities unavailable. Commands time out without
+automatic replay, and restarting or reconnecting does not resend the previous
+light action. Group membership is refreshed with the device inventory. A
+removed group becomes unavailable; reloading removes obsolete group devices.
+Only attributes shared by every member and validated for the group transport
+are exposed: on/off, brightness, RGBW colour, colour temperature and advertised
+numeric effects. A steady colour command clears an active effect in the same
+request. Arbitrary mesh configuration/broadcast commands are not exposed.
+
+Group dispatch is ordered against pending local hub requests. A cloud reply
+is not a physical-delivery barrier across the two transports. Avoid having
+separate controllers issue competing group and individual changes.
+
+Target the app group's light entity in dashboards, scenes and automations.
+For example, for a group that exposes RGBW:
+
+```yaml
+action: light.turn_on
+target:
+  entity_id: light.example_garden
+data:
+  rgbw_color: [0, 255, 0, 0]
+  brightness_pct: 50
+```
 
 ## Troubleshooting
 
@@ -179,7 +223,8 @@ python -m pytest -q
 ```
 
 Tests exercise the transport, telemetry parsing, session recovery, redaction,
-logging, and light-platform behaviour. Light tests stub HA's entity plumbing;
+logging, group discovery and command correlation, reconnects without replay,
+and light-platform behaviour. Light tests stub HA's entity plumbing;
 they do not replace validation in a running Home Assistant instance.
 
 The BLE path was tested on Home Assistant 2026.10.4 with SL5C firmware 3.4.4

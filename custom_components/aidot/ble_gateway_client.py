@@ -296,6 +296,7 @@ class _HubSession:
         self._connection_lock = asyncio.Lock()
         self._request_lock = asyncio.Lock()
         self._command_slots = asyncio.Semaphore(_MAX_IN_FLIGHT)
+        self._group_request_lock = asyncio.Lock()
         self._device_request_locks: dict[str, asyncio.Lock] = {}
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -402,6 +403,23 @@ class _HubSession:
     async def send_command(self, dev_id: str, attr: dict) -> None:
         """Send one command while the session reader owns all socket reads."""
         await self._request("setDevAttrReq", dev_id, attr)
+
+    async def run_group_command(self, operation: Any) -> Any:
+        """Drain local requests before dispatching a cloud group operation.
+
+        This orders client dispatch, not physical delivery across transports.
+        Retain the normal per-device pipeline outside group operations.
+        """
+        acquired = 0
+        async with self._group_request_lock:
+            try:
+                for _ in range(_MAX_IN_FLIGHT):
+                    await self._command_slots.acquire()
+                    acquired += 1
+                return await operation()
+            finally:
+                for _ in range(acquired):
+                    self._command_slots.release()
 
     async def get_attributes(self, dev_id: str, attr: list[str]) -> list[dict]:
         """Perform an explicit one-shot read through the passive dispatcher."""
@@ -929,6 +947,10 @@ async def close_all_hub_sessions() -> None:
 class BleGatewayDeviceClient:
     """Control a BLE mesh light through the AiDot hub's TCP connection."""
 
+    @property
+    def hub_id(self) -> str:
+        return self._hub_id
+
     def __init__(self, device: dict, hub_device: dict, user_id: str) -> None:
         self._device_id: str = device["id"]
         self._hub_id: str = hub_device["id"]
@@ -1184,6 +1206,20 @@ class BleGatewayDeviceClient:
             return
         if self.on_status_update:
             self.on_status_update(self.status)
+
+    def handle_cloud_notification(self, attributes: dict[str, Any]) -> None:
+        """Apply an actual member notification routed from its known hub."""
+        local_online = self.status.online
+        if not self._apply_attributes(attributes, record_freshness=True):
+            return
+        # A cloud report proves fresh telemetry, not that HA can reach the
+        # individual light's local control transport.
+        self.status.online = local_online
+        if self.on_status_update:
+            self.on_status_update(self.status)
+
+    async def async_run_group_command(self, operation: Any) -> Any:
+        return await self._hub_session.run_group_command(operation)
 
     def _handle_hub_connection(self, connected: bool) -> None:
         """Expose whether the passive path to the powered hub is available."""
