@@ -105,6 +105,15 @@ while the last-telemetry sensor records when a device actually reported data.
 An available hub does not establish that every battery-powered light is awake
 or reachable.
 
+Charging is reported only from an actual `chargeState` device report or a
+cloud snapshot whose product metadata advertises that attribute. SL5C cloud
+records can contain `chargeState=0` without advertising charging support; this
+alone leaves the charging sensor **unknown**, rather than **not charging**.
+Battery increases, sunlight, and unrelated light reports do not establish the
+current charging state. The charging entity's `state_source` and `last_reported`
+attributes describe its evidence; a live charging report takes precedence over
+later cloud snapshots.
+
 Cloud device information is refreshed periodically and when hub recovery
 requires it. Established local BLE commands do not contain a cloud access
 token. Invalid cloud sessions are retried once with saved credentials; repeated

@@ -808,6 +808,10 @@ def test_cloud_telemetry_initializes_and_refreshes() -> None:
         "product": {
             "serviceModules": [
                 {
+                    "identity": "sensor.charging",
+                    "properties": [{"identity": "chargeState"}],
+                },
+                {
                     "identity": "control.light.effect.mode",
                     "properties": [
                         {
@@ -879,6 +883,75 @@ def test_cloud_telemetry_initializes_and_refreshes() -> None:
     assert client.status.energy_saving_enabled is True
     assert client.status.energy_saving_factor == 80
     assert seen and seen[-1] is client.status
+
+
+@pytest.mark.parametrize("cached_charge", ["0", "1"])
+def test_unadvertised_cloud_charging_stays_unknown(cached_charge) -> None:
+    """A generic cloud field and rising battery are not charging evidence."""
+    client = _make_diagnostic_client()
+    assert client.status.charging is None
+    assert client.supports_telemetry_attribute("chargeState")
+
+    client.update_cloud_properties({
+        "properties": {"chargeState": cached_charge, "Battery_remaining": 90},
+        "product": {"serviceModules": []},
+    })
+    client._handle_hub_update({"Battery_remaining": 91, "RGBW": 0})
+
+    assert client.status.battery == 91
+    assert client.status.charging is None
+    assert client.charging_diagnostics == {
+        "state_source": "not_reported",
+        "last_reported": None,
+        "cloud_attribute_advertised": False,
+    }
+
+
+@pytest.mark.parametrize("transport", ["hub", "cloud"])
+def test_live_charging_wins_over_cloud_snapshots(transport) -> None:
+    """Actual charging transitions work even without a declared capability."""
+    client = _make_diagnostic_client()
+    client._handle_hub_connection(False)
+    notify = (
+        client._handle_hub_update if transport == "hub"
+        else client.handle_cloud_notification
+    )
+    notify({"chargeState": "1"})
+    assert client.status.charging is True
+    report_time = client.charging_diagnostics["last_reported"]
+    assert report_time is not None
+    assert client.charging_diagnostics["state_source"] == "device_report"
+    assert client.status.online is (transport == "hub")
+
+    # Even an advertised cloud snapshot must not overwrite newer live evidence.
+    client.update_cloud_properties({
+        "properties": {"chargeState": "0"},
+        "product": {"serviceModules": [{"properties": [{"identity": "chargeState"}]}]},
+    })
+    notify({"Battery_remaining": 100, "OnOff": 0})
+    notify({"chargeState": 2})
+    assert client.status.charging is True
+    assert client.charging_diagnostics["last_reported"] == report_time
+
+    notify({"chargeState": "0"})
+    assert client.status.charging is False
+    assert client.charging_diagnostics["state_source"] == "device_report"
+    client.update_cloud_properties({"properties": {"chargeState": "1"}})
+    assert client.status.charging is False
+
+
+def test_removed_cloud_charging_capability_clears_unverified_state() -> None:
+    """A former cloud-only value must not remain when support disappears."""
+    client = _make_client()
+    client.update_cloud_properties({
+        "properties": {"chargeState": "1"},
+        "product": {"serviceModules": [{"properties": [{"identity": "chargeState"}]}]},
+    })
+    assert client.status.charging is True
+    assert client.charging_diagnostics["state_source"] == "cloud_snapshot"
+    client.update_cloud_properties({"properties": {"chargeState": "0"}})
+    assert client.status.charging is None
+    assert client.charging_diagnostics["state_source"] == "not_reported"
 
 
 async def test_passive_update_refreshes_light_and_telemetry(monkeypatch) -> None:
