@@ -134,6 +134,13 @@ class AidotBleBinarySensor(
             self.coordinator.data, self.entity_description.status_key, None
         )
 
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        """Make charging evidence visible without implying other reports refresh it."""
+        if self.entity_description.key == "battery_charging":
+            return self.coordinator.device_client.charging_diagnostics
+        return None
+
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated telemetry."""

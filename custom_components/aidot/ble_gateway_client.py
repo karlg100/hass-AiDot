@@ -174,6 +174,15 @@ def _diagnostic_attributes(device: dict[str, Any]) -> list[str]:
     return sorted(attributes)
 
 
+def _advertises_charge_state(device: dict[str, Any]) -> bool:
+    """Distinguish a product capability from a generic cloud property."""
+    return any(
+        prop.get("identity") == "chargeState"
+        for module in device.get("product", {}).get("serviceModules", [])
+        for prop in module.get("properties", [])
+    )
+
+
 def _parse_int(value: Any, minimum: int, maximum: int) -> int | None:
     """Return an integer within a known telemetry range."""
     try:
@@ -974,6 +983,8 @@ class BleGatewayDeviceClient:
             if isinstance(value, str) and value
         )
         self._diagnostic_attributes = _diagnostic_attributes(device)
+        self._cloud_charging_supported = _advertises_charge_state(device)
+        self._last_charging_report: datetime | None = None
         self._diagnostic_cloud_data = _redact_diagnostics(
             {
                 "modelId": device.get("modelId"),
@@ -1037,7 +1048,10 @@ class BleGatewayDeviceClient:
             ),
             battery=_parse_int(props.get("Battery_remaining"), 0, 100),
             mesh_rssi=_parse_int(props.get("meshNetRssi"), -127, 20),
-            charging=_parse_bool(props.get("chargeState")),
+            charging=(
+                _parse_bool(props.get("chargeState"))
+                if self._cloud_charging_supported else None
+            ),
             energy_saving_enabled=_parse_bool(props.get("energySavingEnable")),
             energy_saving_factor=_parse_percentage_factor(
                 props.get("energySavingFactor")
@@ -1094,7 +1108,16 @@ class BleGatewayDeviceClient:
     def update_cloud_properties(self, device: dict[str, Any]) -> None:
         """Apply cloud state as a low-frequency fallback without active polling."""
         props = device.get("properties", {})
-        self._apply_attributes(props, record_freshness=False)
+        self._cloud_charging_supported = _advertises_charge_state(device)
+        cloud_attributes = dict(props)
+        # SL5C records include chargeState=0 without advertising this capability.
+        # It is not evidence of discharge, and a cached value must not replace
+        # a real charging report received through either live transport.
+        if not self._cloud_charging_supported or self._last_charging_report:
+            cloud_attributes.pop("chargeState", None)
+            if self._last_charging_report is None:
+                self.status.charging = None
+        self._apply_attributes(cloud_attributes, record_freshness=False)
         self._diagnostic_attributes = _diagnostic_attributes(device)
         self._diagnostic_cloud_data["properties"] = _redact_diagnostics(
             props, self._diagnostic_secrets
@@ -1198,7 +1221,25 @@ class BleGatewayDeviceClient:
             self.status.online = True
             self.status.telemetry_connected = True
             self.status.last_telemetry_update = datetime.now(UTC)
+            if _parse_bool(attributes.get("chargeState")) is not None:
+                self._last_charging_report = self.status.last_telemetry_update
         return received
+
+    @property
+    def charging_diagnostics(self) -> dict[str, Any]:
+        """Describe charging evidence independently of other light telemetry."""
+        return {
+            "state_source": (
+                "device_report" if self._last_charging_report is not None
+                else "cloud_snapshot" if self.status.charging is not None
+                else "not_reported"
+            ),
+            "last_reported": (
+                self._last_charging_report.isoformat()
+                if self._last_charging_report is not None else None
+            ),
+            "cloud_attribute_advertised": self._cloud_charging_supported,
+        }
 
     def _handle_hub_update(self, attributes: dict[str, Any]) -> None:
         """Apply an unsolicited update routed by the shared hub listener."""
@@ -1241,6 +1282,7 @@ class BleGatewayDeviceClient:
             "cloud": self._diagnostic_cloud_data,
             "requestedAttributes": self._diagnostic_attributes,
             "listener": self._hub_session.device_diagnostics(self._device_id),
+            "charging": {"value": self.status.charging, **self.charging_diagnostics},
             "probe": {
                 "status": "disabled_passive_mode",
                 "reason": "Avoid waking battery-powered BLE devices",
