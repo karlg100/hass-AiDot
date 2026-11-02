@@ -148,6 +148,27 @@ async def test_telemetry_colour_mode_is_applied(light_module):
     assert light._attr_color_mode == "color_temp"
 
 
+async def test_scene_menu_refreshes_in_place_and_sends_the_discovered_mode(light_module):
+    light, client = make_light(light_module, on=False)
+    client.info.effects = {"Newly discovered": 130}
+    light._handle_coordinator_update()
+    assert light._attr_effect_list == ["Newly discovered"]
+    await light.async_turn_on(effect="Newly discovered", brightness=128)
+    client.send_dev_attr.assert_awaited_once_with(
+        {"OnOff": 1, "EffectMode": 130, "Dimming": 50}
+    )
+    assert light._attr_effect == "Newly discovered"
+    client.info.effects = {"Another scene": 132}
+    client.status.effect_mode = 132
+    light._handle_coordinator_update()
+    assert light._attr_effect_list == ["Another scene"]
+    assert light._attr_effect == "Another scene"
+    client.info.effects = {}
+    light._handle_coordinator_update()
+    assert light._attr_effect_list is None
+    assert not light._attr_supported_features
+
+
 async def test_effects_are_advertised_when_metadata_has_them(light_module):
     light, client = make_light(light_module)
     client.info.effects = {"Rainbow": 5}

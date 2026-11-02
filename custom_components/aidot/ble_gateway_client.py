@@ -1005,6 +1005,7 @@ class BleGatewayDeviceClient:
         }
         enable_rgbw = "control.light.rgbw" in modules
         enable_cct = "control.light.cct" in modules
+        self._metadata_effects = _effect_codes(device)
 
         cct_min, cct_max = 2700, 6500
         for m in device.get("product", {}).get("serviceModules", []):
@@ -1025,7 +1026,7 @@ class BleGatewayDeviceClient:
             hw_version=device.get("hardwareVersion"),
             enable_rgbw=enable_rgbw,
             enable_cct=enable_cct,
-            effects=_effect_codes(device),
+            effects=self._metadata_effects.copy(),
             cct_min=cct_min,
             cct_max=cct_max,
         )
@@ -1128,6 +1129,15 @@ class BleGatewayDeviceClient:
     def supports_telemetry_attribute(self, attribute: str) -> bool:
         """Return whether cloud metadata advertises a telemetry attribute."""
         return attribute in self._diagnostic_attributes
+
+    def update_scene_effects(self, scenes: dict[str, int]) -> None:
+        """Apply discovered app scenes while preserving advertised legacy modes."""
+        effects = {**self._metadata_effects, **scenes}
+        if effects == self.info.effects:
+            return
+        self.info.effects = effects
+        if self.on_status_update:
+            self.on_status_update(self.status)
 
     def _apply_telemetry_attributes(self, attributes: dict[str, Any]) -> bool:
         """Apply recognized live attributes and report whether any were valid."""

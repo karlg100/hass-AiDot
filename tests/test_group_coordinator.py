@@ -102,6 +102,7 @@ async def build_manager(module, monkeypatch):
             self.async_get_all_device = AsyncMock(return_value={"device_list": devices})
             self.async_cleanup = AsyncMock()
             self.async_post_login = AsyncMock()
+            self.async_session_get = AsyncMock(return_value={"data": []})
 
         def set_token_fresh_cb(self, callback):
             self.callback = callback
@@ -147,6 +148,33 @@ async def test_group_discovery_keeps_physical_sensor_coordinators_separate(
         manager.group_cloud._set_connected(True)
         assert group.status.online is True
         assert group.report["memberCount"] == 2
+    finally:
+        await manager.async_cleanup()
+
+
+async def test_scene_discovery_updates_existing_devices_and_common_group_modes(
+    manager_module, monkeypatch
+):
+    manager, _, devices = await build_manager(manager_module, monkeypatch)
+    try:
+        old = manager.device_coordinators["one"]
+        for d in devices:
+            if d.get("type") == "light":
+                d["properties"]["EffectMode"] = 0
+        manager.client.async_session_get.return_value = {"data": [{
+            "name": "New scene", "id": 130, "type": "BLE RGBW",
+            "jsonType": "hex", "params": [], "isFixed": 1,
+        }]}
+        await manager._async_update_data()
+        assert manager.device_coordinators["one"] is old
+        assert old.device_client.info.effects["New scene"] == 130
+        group = manager.group_coordinators["group:home:front"].device_client
+        assert group.info.effects["New scene"] == 130
+        assert manager.client.async_session_get.await_count == 2
+        manager.client.async_session_get.side_effect = ConnectionError()
+        await manager._async_update_data()
+        assert old.device_client.info.effects["New scene"] == 130
+        assert group.info.effects["New scene"] == 130
     finally:
         await manager.async_cleanup()
 
