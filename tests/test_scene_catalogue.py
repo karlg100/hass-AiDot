@@ -30,7 +30,7 @@ def test_legacy_catalogue_and_future_names_are_discovered_without_a_limit():
 
 @pytest.mark.parametrize("changes", [
     {"visible": False}, {"type": "WiFi RGBW"}, {"jsonType": "script"},
-    {"isFixed": 0}, {"params": [{"arbitrary": "command"}]}, {"id": True},
+    {"params": [{"arbitrary": "command"}]}, {"id": True},
     {"id": 1.5}, {"id": 0}, {"id": 65536}, {"name": ""},
 ])
 def test_only_supported_builtin_modes_become_light_commands(changes):
@@ -42,6 +42,13 @@ def test_only_supported_builtin_modes_become_light_commands(changes):
 def test_numeric_string_ids_and_duplicate_display_names():
     assert parse_scenes({"data": [row(mode="130"), row(mode=131)]}) == {
         "Meteor": 130, "Meteor (2)": 131,
+    }
+
+
+@pytest.mark.parametrize("fixed", [0, 1])
+def test_factory_scene_editability_does_not_change_its_mode_command(fixed):
+    assert parse_scenes({"data": [row("Thunderstrike", 859, isFixed=fixed)]}) == {
+        "Thunderstrike": 859
     }
 
 

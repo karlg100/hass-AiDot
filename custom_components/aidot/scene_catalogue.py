@@ -38,10 +38,11 @@ def parse_scenes(response: Any) -> dict[str, int]:
         if (
             row.get("type") != "BLE RGBW"
             or row.get("jsonType") != "hex"
-            or row.get("isFixed") != 1
             or row.get("params") != []
         ):
             continue
+        # Some factory catalogue modes have isFixed=0 but use the same
+        # parameter-free hex representation. That flag is not a mode filter.
         name, mode = row.get("name"), row.get("id")
         if isinstance(mode, str) and mode.isascii() and mode.isdecimal():
             mode = int(mode)
