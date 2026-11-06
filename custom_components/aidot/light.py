@@ -76,13 +76,6 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
             name=coordinator.device_client.info.name,
             hw_version=coordinator.device_client.info.hw_version,
         )
-        self._effect_codes = getattr(coordinator.device_client.info, "effects", {})
-        self._effect_names = {code: name for name, code in self._effect_codes.items()}
-        self._preset_names = getattr(coordinator.device_client.info, "preset_names", [])
-        effects = list(dict.fromkeys([*self._effect_codes, *self._preset_names]))
-        if effects:
-            self._attr_effect_list = effects
-            self._attr_supported_features = LightEntityFeature.EFFECT
         if coordinator.device_client.info.enable_rgbw:
             self._attr_color_mode = ColorMode.RGBW
             self._attr_supported_color_modes = {ColorMode.RGBW, ColorMode.COLOR_TEMP}
@@ -96,6 +89,15 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
 
     def _update_status(self) -> None:
         """Update light status from coordinator data."""
+        # Discovery refreshes existing clients in place. Update the menu on the
+        # same entity instead of requiring a restart to see new app scenes.
+        info = self.coordinator.device_client.info
+        self._effect_codes = getattr(info, "effects", {})
+        self._effect_names = {code: name for name, code in self._effect_codes.items()}
+        self._preset_names = getattr(info, "preset_names", [])
+        effects = list(dict.fromkeys([*self._effect_codes, *self._preset_names]))
+        self._attr_effect_list = effects or None
+        self._attr_supported_features = LightEntityFeature.EFFECT if effects else 0
         self._attr_is_on = self.coordinator.data.on
         self._attr_brightness = self.coordinator.data.dimming
         self._attr_color_temp_kelvin = self.coordinator.data.cct
@@ -187,10 +189,6 @@ class AidotGroupLight(AidotLight):
             identifiers={(DOMAIN, info.dev_id)}, manufacturer="AiDot",
             model="Mesh group", name=info.name,
         )
-        self._effect_codes = info.effects
-        self._effect_names = {code: name for name, code in info.effects.items()}
-        self._attr_effect_list = list(info.effects) or None
-        self._attr_supported_features = LightEntityFeature.EFFECT if info.effects else 0
         if info.enable_rgbw:
             self._attr_supported_color_modes = {ColorMode.RGBW}
             if info.enable_cct:

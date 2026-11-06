@@ -39,6 +39,7 @@ from .const import DOMAIN
 from .group_cloud import GroupCloudClient
 from .group_device import GroupDeviceClient
 from .group_protocol import GroupProtocolError, build_group_request, group_response_code
+from .scene_catalogue import SceneCatalogue
 
 type AidotConfigEntry = ConfigEntry[AidotDeviceManagerCoordinator]
 _LOGGER = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
             token=get_login_data(config_entry.data),
         )
         self.client.set_token_fresh_cb(self.token_fresh_cb)
+        self.scene_catalogue = SceneCatalogue(self.client.async_session_get)
         self.device_coordinators: dict[str, AidotDeviceUpdateCoordinator] = {}
         self.group_coordinators: dict[str, AidotDeviceUpdateCoordinator] = {}
         self._cloud_login_lock = asyncio.Lock()
@@ -187,6 +189,11 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
 
         current_devices = {**wifi_devices, **ble_devices}
 
+        # Catalogue reads do not poll or wake the battery-powered lights.
+        # Failed reads retain the last good data for the same firmware variant.
+        async with self._cloud_login_lock:
+            await self.scene_catalogue.async_refresh(ble_devices.values())
+
         removed_ids = set(self.device_coordinators) - set(current_devices)
         for dev_id in removed_ids:
             coordinator = self.device_coordinators.pop(dev_id)
@@ -208,6 +215,9 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
                     )
                     await device_client.async_update_hub(
                         hub_device, user_id, self._schedule_hub_refresh
+                    )
+                    device_client.update_scene_effects(
+                        self.scene_catalogue.for_device(device)
                     )
                     _LOGGER.debug(
                         "Using BLE gateway client for %s via hub %s",
@@ -231,6 +241,9 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
                         self._schedule_hub_refresh,
                     )
                     existing_client.update_cloud_properties(device)
+                    existing_client.update_scene_effects(
+                        self.scene_catalogue.for_device(device)
+                    )
 
         await start_all_hub_sessions()
         try:

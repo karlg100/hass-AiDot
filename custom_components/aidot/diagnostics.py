@@ -22,6 +22,7 @@ async def async_get_config_entry_diagnostics(
             devices.append(await client.async_get_diagnostics())
 
     return {
+        "sceneCatalogues": entry.runtime_data.scene_catalogue.diagnostics,
         "cloudSession": entry.runtime_data.cloud_status.copy(),
         "cloudGroups": {
             **entry.runtime_data.group_status,

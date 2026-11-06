@@ -114,6 +114,25 @@ current charging state. The charging entity's `state_source` and `last_reported`
 attributes describe its evidence; a live charging report takes precedence over
 later cloud snapshots.
 
+BLE RGBW scene names and mode IDs are discovered from AiDot's model catalogue
+at startup and during the normal six-hour cloud refresh. Compatible new scenes
+appear in the existing light entities' **Effect** menus without a plugin update
+or HA restart. Reloading the integration also refreshes the catalogue. Model,
+firmware version and advertised script capabilities determine which catalogue
+is used; a group exposes only effects supported by every member.
+
+The SL5C catalogue currently contains 39 built-in scenes, including Meteor,
+Aurora, Twinkle, Christmas and Chase. Existing product-advertised effects are
+retained alongside them, so the effect menu may contain additional entries.
+Scene selection uses the existing local hub command for an individual light
+and one cloud group command for an app group. Custom scripts/DIY scenes are
+not included in this firmware-mode discovery.
+
+A failed or unrecognized catalogue refresh retains the last successfully
+loaded catalogue for the same model/firmware/capability combination during
+that integration session. Existing local light control remains available.
+Diagnostics include catalogue counts, last successful reads and error types.
+
 Cloud device information is refreshed periodically and when hub recovery
 requires it. Established local BLE commands do not contain a cloud access
 token. Invalid cloud sessions are retried once with saved credentials; repeated
